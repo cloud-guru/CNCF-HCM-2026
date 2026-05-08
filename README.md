@@ -1,17 +1,6 @@
-# Benchmark: Lazy Loading Container Images on Kubernetes
+# Benchmark: Lazy Loading Container Images for AI/ML on Kubernetes
 
-Google Slides outline · ~13 slides · 15–20 min · platform/infra audience
-Charts already rendered: `charts/pytorch-benchmark.png`, `charts/vllm-benchmark.png`
-
-`---` separates slides. Each slide has on-slide content followed by *Notes* for the speaker.
-
----
-
-## Title
-
-**Benchmark: Lazy Loading Container Images for AI/ML on Kubernetes**
-
-*Your name · VNG Cloud · KubeCommunity 2026*
+*Hoa Ngo · GreenNode · KubeCommunity 2026*
 
 *Notes:* The talk has two halves — benchmark first, then how to actually run it in production.
 
@@ -21,9 +10,9 @@ Charts already rendered: `charts/pytorch-benchmark.png`, `charts/vllm-benchmark.
 
 1. The cold-start problem
 2. Three lazy-loading technologies
-3. Benchmark — Jupyter & vLLM, internal vs external registry
-4. Deploying Lazy loading in production
-5. Appendyx: How a snashotter read/write flows
+3. How a snapshotter reads / writes
+4. Benchmark — Jupyter & vLLM, internal vs external registry
+5. Deploying lazy loading in production
 
 *Notes:* Tell them the shape of the talk. The pivot from "what to use" to "how to run it" comes after the benchmark.
 
@@ -52,11 +41,34 @@ All three need a snapshotter on the node and (for Nydus/Stargz) a one-time image
 
 ---
 
+## How a file read flows through the stack
+
+```
+container reads /opt/conda/.../torch/__init__.py
+    │
+overlayfs       upperdir miss → fall through to lowerdir (FUSE)
+    │
+RAFS FUSE       kernel forwards to nydusd
+    │
+nydusd          image.boot lookup → chunk ID → cache miss
+    │
+HTTPS           GET harbor/.../<sha>.blob   (4 MB)
+    │
+cache           write to /var/lib/containerd-nydus/cache
+    │
+return          bytes flow back up — container never knows
+```
+
+First read: network. Subsequent reads: local cache. Cache survives pod restarts and shares across pods on the same node.
+
+*Notes:* Walk it once top-to-bottom. Sets up why registry locality and chunk size matter when we hit the benchmark slides.
+
+---
+
 ## Test environment
 
 | | |
 |---|---|
-| Cluster | 4 nodes — 1 master + 2 workers + 1 GPU worker |
 | Node spec | 8 vCPU / 16 GB / SSD / 10 Gbps |
 | OS | Ubuntu 24.04, kernel 6.8, containerd |
 | Images | `jupyter-pytorch-cuda-full:v1.9.2` (3.6 GB), `vllm-openai:v0.12.0` (8.3 GB) |
@@ -70,33 +82,17 @@ Measured per run: image pull · time-to-ready · first app metric (`import torch
 
 ## Jupyter PyTorch (3.6 GB) — results
 
-![](charts/pytorch-benchmark.png)
+![w:950](charts/pytorch-benchmark.png)
 
-Harbor (internal):
-- OCI: 113s ready · Nydus: **17.9s** · Stargz: 16.4s · SOCI: 23.4s
-
-VCR (external):
-- OCI: 133s · Nydus: 43s · Stargz: 110s · SOCI: not supported
-
-`import torch` after ready: Nydus/Harbor 8s · Nydus/VCR 46s.
-
-*Notes:* SOCI on VCR was N/A — VCR didn't expose the index format SOCI needs.
+*Notes:* Harbor — OCI 113s, Nydus 17.9s, Stargz 16.4s, SOCI 23.4s. VCR — OCI 133s, Nydus 43s, Stargz 110s, SOCI N/A (VCR didn't expose the index format SOCI needs). `import torch` after ready: Nydus/Harbor 8s, Nydus/VCR 46s.
 
 ---
 
 ## vLLM (8.3 GB) — results
 
-![](charts/vllm-benchmark.png)
+![w:950](charts/vllm-benchmark.png)
 
-Harbor:
-- OCI: 350s · **Nydus: 210s** · SOCI: 290s · Stargz: 350s
-
-VCR:
-- OCI: 350s · Nydus: 340s · Stargz: 360s · SOCI: not supported
-
-First `/health` response: 1.4–2.2s across all working configs.
-
-*Notes:* Smaller relative win on vLLM than on Jupyter. The next slide explains why.
+*Notes:* Harbor — OCI 350s, Nydus 210s, SOCI 290s, Stargz 350s. VCR — OCI 350s, Nydus 340s, Stargz 360s, SOCI N/A. First `/health` response 1.4–2.2s across all working configs. Smaller relative win on vLLM than on Jupyter — next slide explains why.
 
 ---
 
@@ -167,30 +163,6 @@ Either way: workloads pin `<tag>-nydus`. Rollback = swap tag.
 
 ---
 
-## How a file read flows through the stack
-
-```
-container reads /opt/conda/.../torch/__init__.py
-    │
-overlayfs       upperdir miss → fall through to lowerdir (FUSE)
-    │
-RAFS FUSE       kernel forwards to nydusd
-    │
-nydusd          image.boot lookup → chunk ID → cache miss
-    │
-HTTPS           GET harbor/.../<sha>.blob   (4 MB)
-    │
-cache           write to /var/lib/containerd-nydus/cache
-    │
-return          bytes flow back up — container never knows
-```
-
-First read: network. Subsequent reads: local cache. Cache survives pod restarts and shares across pods on the same node.
-
-*Notes:* This is the appendix from §3. Walk it once top-to-bottom.
-
----
-
 ## Recommendation & takeaways
 
 **Pick Nydus** for AI/ML on Kubernetes today.
@@ -200,22 +172,12 @@ First read: network. Subsequent reads: local cache. Cache survives pod restarts 
 | Pod ready, Jupyter | 113s → **17.9s** (6.3×) |
 | Pod ready, vLLM    | 350s → **210s** (1.7×) |
 
-- **SOCI** if your image lacks a giant layer (torch + CUDA) — OCI-compliant, no rebuild. Revisit as registries mature.
+- **SOCI** if your image lacks a giant layer (torch + CUDA) — OCI-compliant, no rebuild.
 - **Stargz** is the awkward middle child.
 - **Registry locality is non-negotiable** — co-locate blobs with workers.
 - **Run the snapshotter as systemd**, not as a Pod.
 - **Audit your cloud** for kubelet/containerd injection + registry-side conversion.
 
-Full report & repo: `github.com/cloud-guru/CNCF-HCM-2026`
-Contact: `tytv2@vng.com.vn`
+Full report & repo: `github.com/cloud-guru/CNCF-HCM-2026` ![w:120](charts/repo-qr.png)
 
 *Notes:* Combined verdict + takeaways. Keep up during Q&A.
-
----
-
-## Appendix (hold for Q&A)
-
-- annotated `config.toml` and `nydusd-config.fusedev.json`
-- node disk layout under `/var/lib/containerd-nydus/`
-- Prometheus metrics on `:9110` (cache hit ratio, fetch latency)
-- failure modes: nydusd crash → FUSE `EIO` → systemd `Restart=always` recovery
