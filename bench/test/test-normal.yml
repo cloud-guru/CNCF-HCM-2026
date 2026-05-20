@@ -1,0 +1,302 @@
+---
+# Test Normal OCI Image Pull
+# Compares traditional full image download vs Nydus lazy loading
+#
+# Usage: ansible-playbook -i hosts.ini test-normal.yml
+
+- name: Cleanup before testing
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-normal"
+  tasks:
+    - name: Delete existing test pod
+      shell: kubectl delete pod {{ test_pod_name }} --ignore-not-found=true
+      changed_when: false
+
+    - name: Wait for pod deletion
+      pause:
+        seconds: 5
+
+- name: Purge image cache on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "external-registry.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2"
+  tasks:
+    - name: List images to find test image
+      shell: ctr -n k8s.io images ls | grep "{{ test_image }}" || true
+      register: image_check
+      changed_when: false
+
+    - name: Remove test image from containerd
+      shell: ctr -n k8s.io images rm "{{ test_image }}"
+      when: image_check.stdout != ""
+      ignore_errors: yes
+
+    - name: Remove all overlayfs snapshots
+      shell: |
+        ctr -n k8s.io snapshots --snapshotter overlayfs ls | tail -n +2 | awk '{print $1}' | while read snap; do
+          if [ -n "$snap" ]; then
+            ctr -n k8s.io snapshots --snapshotter overlayfs rm "$snap" 2>/dev/null || true
+          fi
+        done
+      ignore_errors: yes
+
+    - name: Find and remove content with stale snapshot references
+      shell: |
+        ctr -n k8s.io content ls | grep "{{ test_image.split('/')[-1].split(':')[0] }}" | awk '{print $1}' | while read digest; do
+          ctr -n k8s.io content rm "$digest" 2>/dev/null || true
+        done
+      ignore_errors: yes
+
+    - name: Restart containerd to clear metadata cache
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Wait for containerd to be ready
+      pause:
+        seconds: 5
+
+    - name: Display cleanup status
+      debug:
+        msg:
+          - "{{ inventory_hostname }}: Complete cleanup done"
+          - "  • Image removed"
+          - "  • Snapshots purged"
+          - "  • Content store cleared"
+          - "  • Containerd restarted"
+
+- name: Test normal OCI image pull
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_image: "external-registry.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2"
+    image_pull_secret: "vcr-creds"
+    test_pod_name: "test-normal"
+    log_dir: "./normal-test-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Create log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: no
+
+    - name: Export log_dir so later plays use the same folder
+      set_fact:
+        normal_log_dir: "{{ log_dir }}"
+
+    - name: Wait for Cilium to be ready after containerd restart
+      pause:
+        seconds: 60
+
+    - name: Display test info
+      debug:
+        msg: "Starting test with clean image cache - measuring traditional OCI pull performance"
+
+    - name: Measure pod startup time with normal OCI pull
+      shell: |
+        START=$(date +%s.%N)
+        kubectl run {{ test_pod_name }} \
+          --image={{ test_image }} \
+          --overrides='{
+            "spec": {
+              "imagePullSecrets": [{"name": "{{ image_pull_secret }}"}],
+              "containers": [{
+                "name": "{{ test_pod_name }}",
+                "image": "{{ test_image }}",
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/api",
+                    "port": 8888
+                  },
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 5,
+                  "timeoutSeconds": 5,
+                  "successThreshold": 1,
+                  "failureThreshold": 60
+                }
+              }]
+            }
+          }'
+
+        if kubectl wait --for=condition=Ready pod/{{ test_pod_name }} --timeout=600s; then
+          END=$(date +%s.%N)
+          DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+          echo "=== TIMING ==="
+          echo "Start: $START"
+          echo "End: $END"
+          echo "Duration: ${DURATION} seconds"
+          echo ""
+          echo "=== POD EVENTS ==="
+          kubectl describe pod {{ test_pod_name }} | grep -A 20 "Events:"
+          exit 0
+        else
+          echo "Pod failed to start within 600 seconds"
+          kubectl describe pod {{ test_pod_name }} | tail -30
+          exit 1
+        fi
+      register: startup_time
+      async: 700
+      poll: 15
+      ignore_errors: yes
+
+    - name: Get node where pod is running
+      shell: kubectl get pod {{ test_pod_name }} -o jsonpath='{.spec.nodeName}'
+      register: pod_node
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Get image size
+      shell: kubectl describe pod {{ test_pod_name }} | grep "Image size:" | awk '{print $(NF-1), $NF}'
+      register: image_size
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Save complete test results to log file
+      copy:
+        content: |
+          ========================================
+          Normal OCI Image Pull Test Results
+          ========================================
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Test Image: {{ test_image }}
+          Pod Name: {{ test_pod_name }}
+          Node: {{ pod_node.stdout | default('N/A') }}
+          Image Size: {{ image_size.stdout | default('N/A') }}
+
+          ========================================
+          Startup Time Measurement
+          ========================================
+          {{ startup_time.stdout }}
+
+          ========================================
+          What This Measures
+          ========================================
+          • Image pull (Traditional OCI - downloads ENTIRE image before starting)
+          • Container creation
+          • Jupyter server initialization
+          • Readiness probe success (HTTP /api endpoint)
+
+          Traditional OCI: Must download full 9GB before container can start
+          With Nydus: Only metadata (~3.5GB) + on-demand chunks
+
+          ========================================
+          Test Status: {% if startup_time.rc == 0 %}PASSED ✓{% else %}FAILED ✗{% endif %}
+
+          ========================================
+        dest: "{{ log_dir }}/test-results.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display timing results
+      debug:
+        msg:
+          - "========================================"
+          - "Normal OCI Image Pull Time"
+          - "========================================"
+          - ""
+          - "{{ startup_time.stdout_lines }}"
+          - ""
+          - "{% if startup_time.rc == 0 %}✓ Startup time test PASSED{% else %}✗ Startup time test FAILED{% endif %}"
+          - ""
+          - "Logs saved to: {{ log_dir }}/"
+          - ""
+          - "Compare this with Nydus test results to see the difference!"
+
+- name: Test PyTorch import (already downloaded)
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-normal"
+    log_dir: "./normal-test-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Import PyTorch (all libraries already present)
+      shell: |
+        START=$(date +%s.%N)
+        OUTPUT=$(kubectl exec {{ test_pod_name }} -- python3 -c "import torch; print('PyTorch version:', torch.__version__)")
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+        echo "$OUTPUT"
+        echo "Import time: ${DURATION} seconds"
+      register: pytorch_test
+      ignore_errors: yes
+
+    - name: Save PyTorch test to log
+      copy:
+        content: |
+          ========================================
+          PyTorch Import Test (Traditional OCI)
+          ========================================
+          {{ pytorch_test.stdout }}
+
+          Status: {% if pytorch_test.rc == 0 %}PASSED ✓{% else %}FAILED ✗{% endif %}
+
+          With traditional OCI, all PyTorch libraries were downloaded during image pull.
+          No on-demand loading - everything already present.
+        dest: "{{ hostvars[groups['master'][0]]['normal_log_dir'] }}/pytorch-test.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display PyTorch test result
+      debug:
+        msg:
+          - "PyTorch import: {% if pytorch_test.rc == 0 %}✓ PASSED{% else %}✗ FAILED{% endif %}"
+          - "{{ pytorch_test.stdout }}"
+
+- name: Verify worker nodes and check image
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "external-registry.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2"
+    log_dir: "{{ hostvars[groups['master'][0]]['normal_log_dir'] }}"
+  tasks:
+    - name: Check if image was pulled
+      shell: ctr -n k8s.io images ls | grep "{{ test_image }}" || echo "Image not found"
+      register: image_status
+      changed_when: false
+
+    - name: Get image size from containerd
+      shell: ctr -n k8s.io images ls | grep "{{ test_image }}" | awk '{print $7, $8}'
+      register: image_size_ctr
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Check overlayfs snapshots
+      shell: ctr -n k8s.io snapshots --snapshotter overlayfs ls | wc -l
+      register: snapshot_count
+      changed_when: false
+
+    - name: Save worker node status to consolidated log file
+      blockinfile:
+        path: "{{ log_dir }}/worker-image-stats.log"
+        marker: "# {mark} {{ inventory_hostname }}"
+        create: yes
+        block: |
+          ========================================
+          Worker Node: {{ inventory_hostname }}
+          ========================================
+          Image Status: {{ 'Pulled' if image_status.stdout != 'Image not found' else 'Not found' }}
+          Image Size: {{ image_size_ctr.stdout | default('N/A') }}
+          Active snapshots: {{ snapshot_count.stdout }}
+
+          Traditional OCI stores full image layers
+          No lazy loading - complete download before start
+
+      delegate_to: localhost
+      become: no
+
+    - name: Display worker node status
+      debug:
+        msg:
+          - "========================================"
+          - "{{ inventory_hostname }}"
+          - "========================================"
+          - "  Image: {{ 'Pulled' if image_status.stdout != 'Image not found' else 'Not found' }}"
+          - "  Size: {{ image_size_ctr.stdout | default('N/A') }}"
+          - "  Snapshots: {{ snapshot_count.stdout }}"

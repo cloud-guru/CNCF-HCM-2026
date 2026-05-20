@@ -1,0 +1,24 @@
+========================================
+Nydus vLLM Test Results
+========================================
+Timestamp: 2026-03-05T08:03:28Z
+Image: external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0-nydus
+Pod: test-nydus-vllm
+Node: worker-4
+
+pod/test-nydus-vllm created
+pod/test-nydus-vllm condition met
+=== TIMING ===
+Duration: 340.44 seconds
+
+=== POD EVENTS ===
+Events:
+  Type     Reason     Age                   From     Message
+  ----     ------     ----                  ----     -------
+  Normal   Pulling    5m40s                 kubelet  Pulling image "external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0-nydus"
+  Normal   Pulled     5m38s                 kubelet  Successfully pulled image "external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0-nydus" in 1.571s (1.571s including waiting). Image size: 11538605879 bytes.
+  Normal   Created    5m37s                 kubelet  Created container: test-nydus-vllm
+  Normal   Started    5m23s                 kubelet  Started container test-nydus-vllm
+  Warning  Unhealthy  30s (x30 over 4m50s)  kubelet  Readiness probe failed: Get "http://10.244.3.248:8000/health": dial tcp 10.244.3.248:8000: connect: connection refused
+
+Status: PASSED

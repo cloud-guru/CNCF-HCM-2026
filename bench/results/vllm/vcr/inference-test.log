@@ -1,0 +1,7 @@
+========================================
+vLLM Inference Endpoint Test (VCR)
+========================================
+{"id":"cmpl-bf3f280c79992d47","object":"text_completion","created":1772693313,"model":"meta-llama/Meta-Llama-3-8B","choices":[{"index":0,"text":". I am looking for a tutor to help me with my GCSE Maths. I am a very slow learner and need help in every topic. I am a very hard worker and am willing to learn.","logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null,"prompt_logprobs":null,"prompt_token_ids":null}],"service_tier":null,"system_fingerprint":null,"usage":{"prompt_tokens":2,"total_tokens":44,"completion_tokens":42,"prompt_tokens_details":null},"kv_transfer_params":null}
+Inference time: 1.36 seconds
+
+Status: PASSED

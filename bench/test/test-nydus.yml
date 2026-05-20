@@ -1,0 +1,421 @@
+---
+# Test Nydus Installation
+# Tests lazy loading functionality and measures pod startup time
+#
+# Usage: ansible-playbook -i hosts.ini test-nydus.yml
+#
+# Prerequisites:
+# - Nydus must be installed on worker nodes (run install-nydus.yml first)
+# - Harbor credentials secret must exist in Kubernetes
+
+- name: Cleanup before testing
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-nydus"
+  tasks:
+    - name: Delete existing test pod
+      shell: kubectl delete pod {{ test_pod_name }} --ignore-not-found=true
+      changed_when: false
+
+    - name: Wait for pod deletion
+      pause:
+        seconds: 5
+
+- name: Purge image cache on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-nydus"
+  tasks:
+    - name: List images to find Nydus image
+      shell: ctr -n k8s.io images ls | grep "{{ test_image }}" || true
+      register: image_check
+      changed_when: false
+
+    - name: Remove Nydus image from containerd
+      shell: ctr -n k8s.io images rm "{{ test_image }}"
+      when: image_check.stdout != ""
+      ignore_errors: yes
+
+    - name: Remove all Nydus snapshots from containerd
+      shell: |
+        ctr -n k8s.io snapshots --snapshotter nydus ls | tail -n +2 | awk '{print $1}' | while read snap; do
+          if [ -n "$snap" ]; then
+            ctr -n k8s.io snapshots --snapshotter nydus rm "$snap" 2>/dev/null || true
+          fi
+        done
+      ignore_errors: yes
+
+    - name: Find overlayfs snapshots referencing Nydus image (cross-snapshotter cleanup)
+      shell: |
+        ctr -n k8s.io snapshots --snapshotter overlayfs ls | grep -E "{{ test_image.split('/')[-1].split(':')[0] }}" | awk '{print $1}' || true
+      register: overlayfs_stale_snapshots
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Remove stale overlayfs snapshots
+      shell: |
+        echo "{{ overlayfs_stale_snapshots.stdout }}" | while read snap; do
+          if [ -n "$snap" ]; then
+            ctr -n k8s.io snapshots --snapshotter overlayfs rm "$snap" 2>/dev/null || true
+          fi
+        done
+      when: overlayfs_stale_snapshots.stdout != ""
+      ignore_errors: yes
+
+    - name: Find and remove content with stale snapshot references
+      shell: |
+        # Find content that references our test image in GC labels
+        ctr -n k8s.io content ls | grep "{{ test_image.split('/')[-1].split(':')[0] }}" | awk '{print $1}' | while read digest; do
+          ctr -n k8s.io content rm "$digest" 2>/dev/null || true
+        done
+      ignore_errors: yes
+
+    - name: Find and remove pause container content with stale nydus snapshot references
+      shell: |
+        # Find pause container content with GC refs to nydus snapshots
+        ctr -n k8s.io content ls | grep "containerd.io/gc.ref.snapshot.nydus" | awk '{print $1}' | while read digest; do
+          ctr -n k8s.io content rm "$digest" 2>/dev/null || true
+        done
+      ignore_errors: yes
+
+    - name: Stop nydus-snapshotter to unmount FUSE filesystems
+      systemd:
+        name: nydus-snapshotter
+        state: stopped
+
+    - name: Wait for FUSE unmounts
+      pause:
+        seconds: 3
+
+    - name: Kill any remaining nydusd processes
+      shell: pkill -9 nydusd || true
+      ignore_errors: yes
+
+    - name: Force unmount all stale FUSE/nydus mounts
+      shell: |
+        for mnt in $(mount | grep -E "rafs|nydus|fuse" | awk '{print $3}'); do
+          umount -f "$mnt" 2>/dev/null || true
+          umount -l "$mnt" 2>/dev/null || true
+        done
+        for dir in /var/lib/containerd-nydus/snapshots/*/mnt; do
+          [ -d "$dir" ] && { umount -f "$dir" 2>/dev/null; umount -l "$dir" 2>/dev/null; } || true
+        done
+      ignore_errors: yes
+
+    - name: Clean up Nydus cache directory (full wipe + recreate)
+      shell: |
+        rm -rf /var/lib/containerd-nydus/cache
+        mkdir -p /var/lib/containerd-nydus/cache
+      ignore_errors: yes
+
+    - name: Verify cache is empty
+      shell: find /var/lib/containerd-nydus/cache -type f | wc -l
+      register: cache_check
+      changed_when: false
+
+    - name: Fail if cache not empty
+      fail:
+        msg: "Cache still has {{ cache_check.stdout }} files after cleanup!"
+      when: cache_check.stdout | int > 0
+
+    - name: Remove snapshot directories (now that FUSE is unmounted)
+      shell: rm -rf /var/lib/containerd-nydus/snapshots/*
+      ignore_errors: yes
+
+    - name: Remove config and socket directories
+      shell: |
+        rm -rf /var/lib/containerd-nydus/config/*
+        rm -rf /var/lib/containerd-nydus/socket/*
+        rm -rf /var/lib/containerd-nydus/logs/*
+      ignore_errors: yes
+
+    - name: Wipe containerd metadata DB to clear stale nydus snapshot references
+      shell: |
+        systemctl stop containerd
+        rm -rf /var/lib/containerd/io.containerd.metadata.v1.bolt/
+        systemctl start containerd
+      ignore_errors: yes
+
+    - name: Remove database files (prevent corruption)
+      shell: rm -f /var/lib/containerd-nydus/*.db
+      ignore_errors: yes
+
+    - name: Restart nydus-snapshotter with clean state
+      systemd:
+        name: nydus-snapshotter
+        state: restarted
+
+    - name: Wait for nydus-snapshotter to be ready
+      wait_for:
+        path: /run/containerd-nydus/containerd-nydus-grpc.sock
+        timeout: 30
+
+    - name: Restart containerd to clear metadata cache
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Wait for containerd to be ready
+      pause:
+        seconds: 5
+
+    - name: Verify Nydus plugin is available
+      shell: ctr plugins ls | grep nydus
+      register: plugin_check
+      changed_when: false
+
+    - name: Display cleanup status
+      debug:
+        msg:
+          - "{{ inventory_hostname }}: Complete cleanup done"
+          - "  • Image removed"
+          - "  • Snapshots purged"
+          - "  • Cache cleared"
+          - "  • Database reset"
+          - "  • Services restarted"
+          - "  • Plugin status: {{ plugin_check.stdout_lines[0] if plugin_check.stdout_lines else 'not found' }}"
+
+- name: Test Nydus lazy loading
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-nydus"
+    image_pull_secret: "harbor-creds"
+    test_pod_name: "test-nydus"
+    log_dir: "./nydus-test-{{ ansible_date_time.epoch }}"
+    target_node: "worker-4"
+  tasks:
+    # ============================================
+    # Test: Real Application Startup Time
+    # ============================================
+    - name: Create log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: no
+
+    - name: Export log_dir so later plays use the same folder
+      set_fact:
+        nydus_log_dir: "{{ log_dir }}"
+
+    - name: Wait for Cilium to be ready after containerd restart
+      pause:
+        seconds: 60
+
+    - name: Display test info
+      debug:
+        msg: "Starting fresh test with clean image cache - measuring true lazy loading performance"
+
+    - name: Measure pod startup time with real application
+      shell: |
+        START=$(date +%s.%N)
+        kubectl run {{ test_pod_name }} \
+          --image={{ test_image }} \
+          --overrides='{
+            "spec": {
+              "nodeName": "{{ target_node }}",
+              "imagePullSecrets": [{"name": "{{ image_pull_secret }}"}],
+              "containers": [{
+                "name": "{{ test_pod_name }}",
+                "image": "{{ test_image }}",
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/api",
+                    "port": 8888
+                  },
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 5,
+                  "timeoutSeconds": 5,
+                  "successThreshold": 1,
+                  "failureThreshold": 60
+                }
+              }]
+            }
+          }'
+
+        if kubectl wait --for=condition=Ready pod/{{ test_pod_name }} --timeout=360s; then
+          END=$(date +%s.%N)
+          DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+          echo "=== TIMING ==="
+          echo "Start: $START"
+          echo "End: $END"
+          echo "Duration: ${DURATION} seconds"
+          echo ""
+          echo "=== POD EVENTS ==="
+          kubectl describe pod {{ test_pod_name }} | grep -A 20 "Events:"
+          exit 0
+        else
+          echo "Pod failed to start within 360 seconds"
+          kubectl describe pod {{ test_pod_name }} | tail -30
+          exit 1
+        fi
+      register: startup_time
+      async: 420
+      poll: 15
+      ignore_errors: yes
+
+    - name: Get node where pod is running
+      shell: kubectl get pod {{ test_pod_name }} -o jsonpath='{.spec.nodeName}'
+      register: pod_node
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Save complete test results to log file
+      copy:
+        content: |
+          ========================================
+          Nydus Lazy Loading Test Results
+          ========================================
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Test Image: {{ test_image }}
+          Pod Name: {{ test_pod_name }}
+          Node: {{ pod_node.stdout | default('N/A') }}
+
+          ========================================
+          Startup Time Measurement
+          ========================================
+          {{ startup_time.stdout }}
+
+          ========================================
+          What This Measures
+          ========================================
+          • Image pull (Nydus lazy loading - only metadata downloaded)
+          • Container creation
+          • Jupyter server initialization
+          • Readiness probe success (HTTP /api endpoint)
+
+          With Nydus: Chunks loaded on-demand as Jupyter needs them
+          Without Nydus: Must download full 9GB before container starts
+
+          ========================================
+          Test Status: {% if startup_time.rc == 0 %}PASSED ✓{% else %}FAILED ✗{% endif %}
+
+          ========================================
+        dest: "{{ log_dir }}/test-results.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display timing results
+      debug:
+        msg:
+          - "========================================"
+          - "Real Application Startup Time"
+          - "========================================"
+          - ""
+          - "{{ startup_time.stdout_lines }}"
+          - ""
+          - "{% if startup_time.rc == 0 %}✓ Startup time test PASSED{% else %}✗ Startup time test FAILED{% endif %}"
+          - ""
+          - "Logs saved to: {{ log_dir }}/"
+
+- name: Test PyTorch import (on-demand loading)
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-nydus"
+    log_dir: "./nydus-test-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Import PyTorch to trigger on-demand chunk loading
+      shell: |
+        START=$(date +%s.%N)
+        OUTPUT=$(kubectl exec {{ test_pod_name }} -- python3 -c "import torch; print('PyTorch version:', torch.__version__)")
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+        echo "$OUTPUT"
+        echo "Import time: ${DURATION} seconds"
+      register: pytorch_test
+      ignore_errors: yes
+
+    - name: Save PyTorch test to log
+      copy:
+        content: |
+          ========================================
+          PyTorch Import Test (On-Demand Loading)
+          ========================================
+          {{ pytorch_test.stdout }}
+
+          Status: {% if pytorch_test.rc == 0 %}PASSED ✓{% else %}FAILED ✗{% endif %}
+
+          This triggers Nydus to fetch PyTorch library chunks on-demand.
+        dest: "{{ hostvars[groups['master'][0]]['nydus_log_dir'] }}/pytorch-test.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display PyTorch test result
+      debug:
+        msg:
+          - "PyTorch import: {% if pytorch_test.rc == 0 %}✓ PASSED{% else %}✗ FAILED{% endif %}"
+          - "{{ pytorch_test.stdout }}"
+
+- name: Verify Nydus on worker nodes and check cache
+  hosts: workers
+  become: yes
+  vars:
+    log_dir: "{{ hostvars[groups['master'][0]]['nydus_log_dir'] }}"
+  tasks:
+    - name: Check nydus-snapshotter service status
+      shell: systemctl is-active nydus-snapshotter
+      register: nydus_service
+      changed_when: false
+
+    - name: Check Nydus plugin status
+      shell: ctr plugins ls | grep nydus
+      register: nydus_plugin
+      changed_when: false
+
+    - name: Check cache size (after test)
+      shell: du -sh /var/lib/containerd-nydus/cache 2>/dev/null || echo "0 cache"
+      register: cache_size
+      changed_when: false
+
+    - name: Count cached chunks
+      shell: find /var/lib/containerd-nydus/cache -type f 2>/dev/null | wc -l
+      register: chunk_count
+      changed_when: false
+
+    - name: Check active snapshots
+      shell: ctr -n k8s.io snapshots ls 2>/dev/null | wc -l
+      register: snapshot_count
+      changed_when: false
+
+    - name: Save worker node status to consolidated log file
+      blockinfile:
+        path: "{{ log_dir }}/worker-cache-stats.log"
+        marker: "# {mark} {{ inventory_hostname }}"
+        create: yes
+        block: |
+          ========================================
+          Worker Node: {{ inventory_hostname }}
+          ========================================
+          Service: {{ nydus_service.stdout }}
+          Plugin: {{ nydus_plugin.stdout_lines[0] if nydus_plugin.stdout_lines else 'not found' }}
+          Cache size: {{ cache_size.stdout }}
+          Cached chunks: {{ chunk_count.stdout }}
+          Active snapshots: {{ snapshot_count.stdout }}
+
+          This shows how much data was actually downloaded
+          vs the full 9GB image size with traditional OCI pull
+
+      delegate_to: localhost
+      become: no
+
+    - name: Display worker node status
+      debug:
+        msg:
+          - "========================================"
+          - "{{ inventory_hostname }}"
+          - "========================================"
+          - "  Service: {{ nydus_service.stdout }}"
+          - "  Plugin: {{ nydus_plugin.stdout_lines[0] if nydus_plugin.stdout_lines else 'not found' }}"
+          - "  Cache size: {{ cache_size.stdout }}"
+          - "  Cached chunks: {{ chunk_count.stdout }}"
+          - "  Active snapshots: {{ snapshot_count.stdout }}"
+          - ""
+          - "This shows how much data was actually downloaded"
+          - "vs the full 9GB image size with traditional OCI pull"

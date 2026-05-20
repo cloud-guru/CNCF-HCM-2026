@@ -1,0 +1,67 @@
+---
+# Convert OCI image to SOCI format using nerdctl image convert
+# nerdctl has built-in SOCI support via --soci flag
+#
+# SOCI: Seekable OCI - AWS lazy loading format with zTOC index per layer
+# Ref: https://github.com/containerd/nerdctl/blob/main/docs/image-lazypull.md
+#
+# Usage: ansible-playbook -i hosts.ini create-soci-index.yml
+
+- name: Convert OCI image to SOCI and push to Harbor
+  hosts: buildhost
+  become: yes
+  vars:
+    source_image: "external-registry.example.com/108942-public69/jupyter-pytorch-cuda-full:v1.9.2"
+    target_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-soci"
+    harbor_registry: "harbor.example.com"
+    harbor_username: "admin"
+    harbor_password: "CHANGE_ME"
+
+  tasks:
+    - name: Install nerdctl if not present
+      shell: |
+        if [ -x /usr/local/bin/nerdctl ]; then
+          echo "nerdctl already installed"
+          exit 0
+        fi
+        cd /tmp
+        wget -q https://github.com/containerd/nerdctl/releases/download/v2.2.1/nerdctl-2.2.1-linux-amd64.tar.gz
+        tar -xzf nerdctl-2.2.1-linux-amd64.tar.gz
+        mv nerdctl /usr/local/bin/
+        chmod +x /usr/local/bin/nerdctl
+        rm -f nerdctl-2.2.1-linux-amd64.tar.gz
+        echo "nerdctl installed"
+
+    - name: Login to Harbor with nerdctl
+      shell: echo "{{ harbor_password }}" | nerdctl login -u {{ harbor_username }} --password-stdin {{ harbor_registry }}
+
+    - name: Pull source OCI image
+      shell: nerdctl pull {{ source_image }}
+      register: pull_result
+
+    - name: Convert to SOCI
+      # --soci: convert to SOCI Index V2 format (zTOC per layer)
+      # --oci: output OCI-compatible manifest (required by Harbor)
+      shell: nerdctl image convert --soci --oci {{ source_image }} {{ target_image }}
+      register: convert_result
+
+    - name: Push SOCI image to Harbor
+      shell: nerdctl push {{ target_image }}
+      register: push_result
+
+    - name: Display results
+      debug:
+        msg:
+          - "========================================"
+          - "SOCI Conversion Results"
+          - "========================================"
+          - "Source: {{ source_image }}"
+          - "Target: {{ target_image }}"
+          - ""
+          - "Pull:    {{ 'SUCCESS' if pull_result.rc == 0 else 'FAILED' }}"
+          - "Convert: {{ 'SUCCESS' if convert_result.rc == 0 else 'FAILED' }}"
+          - "Push:    {{ 'SUCCESS' if push_result.rc == 0 else 'FAILED' }}"
+          - ""
+          - "Next steps:"
+          - "1. Install SOCI snapshotter on workers: ansible-playbook -i hosts.ini install-soci.yml"
+          - "2. Test with: ansible-playbook -i hosts.ini test-soci.yml"

@@ -1,0 +1,13 @@
+# BEGIN lab5
+========================================
+Worker Node: lab5
+========================================
+Service: active
+Plugin: io.containerd.snapshotter.v1           nydus                    linux/amd64    ok        
+Cache size: 7.5G	/var/lib/containerd-nydus/cache
+Cached chunks: 69
+Active snapshots: 1
+
+This shows how much data was actually downloaded
+vs the full 9GB image size with traditional OCI pull
+# END lab5

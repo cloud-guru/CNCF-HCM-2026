@@ -1,0 +1,33 @@
+# BEGIN lab2
+========================================
+Worker Node: lab2
+========================================
+Image Status: Pulled
+Image Size: io.cri-containerd.image=managed 
+Active snapshots: 44
+
+Traditional OCI stores full image layers
+No lazy loading - complete download before start
+# END lab2
+# BEGIN lab3
+========================================
+Worker Node: lab3
+========================================
+Image Status: Not found
+Image Size: 
+Active snapshots: 10
+
+Traditional OCI stores full image layers
+No lazy loading - complete download before start
+# END lab3
+# BEGIN lab4
+========================================
+Worker Node: lab4
+========================================
+Image Status: Not found
+Image Size: 
+Active snapshots: 19
+
+Traditional OCI stores full image layers
+No lazy loading - complete download before start
+# END lab4

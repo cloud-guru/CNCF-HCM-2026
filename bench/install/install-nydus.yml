@@ -1,0 +1,341 @@
+---
+# Fresh Nydus installation with CRI-based authentication
+# No hardcoded credentials - uses Kubernetes secrets
+
+- name: Install Nydus with CRI authentication
+  hosts: workers
+  become: yes
+  vars:
+    harbor_registry: "harbor.example.com"
+    harbor_username: "admin"
+    harbor_password: "CHANGE_ME"
+  tasks:
+    # ============================================
+    # Step 1: Stop and remove old configuration
+    # ============================================
+    - name: Stop nydus-snapshotter if running
+      systemd:
+        name: nydus-snapshotter
+        state: stopped
+      ignore_errors: yes
+
+    - name: Remove old nydus configuration files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/nydus/config.toml
+        - /etc/nydus/nydusd-config.fusedev.json
+        - /etc/containerd/certs.d/{{ harbor_registry }}/hosts.toml
+
+    # ============================================
+    # Step 2: Install Nydus binaries
+    # ============================================
+    - name: Ensure Nydus binaries are installed
+      stat:
+        path: /usr/bin/nydusd
+      register: nydusd_binary
+
+    - name: Copy and extract binaries if not present
+      block:
+        - name: Create temp directory
+          file:
+            path: /tmp/nydus-install
+            state: directory
+
+        - name: Copy binaries tarball
+          copy:
+            src: ../nydus-2.4.0-snapshotter-0.15.11-linux-amd64.tar.gz
+            dest: /tmp/nydus-install/
+
+        - name: Extract binaries
+          unarchive:
+            src: /tmp/nydus-install/nydus-2.4.0-snapshotter-0.15.11-linux-amd64.tar.gz
+            dest: /tmp/nydus-install
+            remote_src: yes
+
+        - name: Install binaries
+          copy:
+            src: "/tmp/nydus-install/nydus-worker-binaries/{{ item }}"
+            dest: "/usr/bin/{{ item }}"
+            remote_src: yes
+            mode: '0755'
+          loop:
+            - containerd-nydus-grpc
+            - nydusd
+            - nydus-image
+            - nydusctl
+      when: not nydusd_binary.stat.exists
+
+    # ============================================
+    # Step 3: Create new config.toml with CRI auth
+    # ============================================
+    - name: Ensure nydus config directory exists
+      file:
+        path: /etc/nydus
+        state: directory
+        mode: '0755'
+
+    - name: Create nydus-snapshotter config with CRI authentication
+      copy:
+        content: |
+          version = 1
+          root = "/var/lib/containerd-nydus"
+          gc_period = "24h"
+          address = "/run/containerd-nydus/containerd-nydus-grpc.sock"
+          daemon_mode = "dedicated"
+          enable_system_controller = true
+
+          [daemon]
+          nydusd_path = "/usr/bin/nydusd"
+          nydusimage_path = "/usr/bin/nydus-image"
+          nydusd_config = "/etc/nydus/nydusd-config.fusedev.json"
+          fs_driver = "fusedev"
+          threads_number = 4
+
+          [remote]
+          convert_vpc_registry = false
+
+          [remote.auth]
+          enable_cri_keychain = true
+          image_service_address = "/run/containerd/containerd.sock"
+
+          [remote.mirrors_config]
+          dir = "/etc/containerd/certs.d"
+          
+          [snapshot]
+          enable_nydus_overlayfs = false
+          
+          [cache_manager]
+          disable = false
+          gc_period = "24h"
+          cache_dir = "/var/lib/containerd-nydus/cache"
+          
+          [log]
+          log_to_stdout = false
+          level = "info"
+          log_dir = "/var/log/nydus-snapshotter"
+          log_rotation_size = 100
+          log_rotation_max_backups = 10
+          
+          [metrics]
+          address = ":9110"
+          enable_pprof = false
+        dest: /etc/nydus/config.toml
+        mode: '0644'
+
+    # ============================================
+    # Step 4: Create nydusd config with registry backend (Harbor)
+    # Auth handled by CRI keychain - no hardcoded credentials here
+    # ============================================
+    - name: Create nydusd config with registry backend for on-demand chunk fetching
+      copy:
+        content: |
+          {
+            "device": {
+              "backend": {
+                "type": "registry",
+                "config": {
+                  "scheme": "https",
+                  "skip_verify": true,
+                  "timeout": 10,
+                  "connect_timeout": 10,
+                  "retry_limit": 3
+                }
+              },
+              "cache": {
+                "type": "blobcache",
+                "config": {
+                  "work_dir": "/var/lib/containerd-nydus/cache"
+                }
+              }
+            },
+            "mode": "direct",
+            "digest_validate": false,
+            "enable_xattr": true,
+            "fs_prefetch": {
+              "enable": true,
+              "threads_count": 8,
+              "merging_size": 1048576,
+              "prefetch_all": false
+            }
+          }
+        dest: /etc/nydus/nydusd-config.fusedev.json
+        mode: '0644'
+
+    # ============================================
+    # Step 5: Create systemd service
+    # ============================================
+    - name: Create nydus-snapshotter systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=Nydus snapshotter for containerd with CRI authentication
+          After=network.target containerd.service
+          Requires=containerd.service
+          
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/containerd-nydus-grpc --config /etc/nydus/config.toml
+          Restart=always
+          RestartSec=5
+          KillMode=mixed
+          KillSignal=SIGTERM
+          StandardOutput=journal
+          StandardError=journal
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/nydus-snapshotter.service
+        mode: '0644'
+
+    # ============================================
+    # Step 6: Configure containerd registry WITHOUT auth
+    # ============================================
+    - name: Create containerd certs directory
+      file:
+        path: "/etc/containerd/certs.d/{{ harbor_registry }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create hosts.toml without authorization header
+      copy:
+        content: |
+          server = "https://{{ harbor_registry }}"
+          
+          [host."https://{{ harbor_registry }}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+        dest: "/etc/containerd/certs.d/{{ harbor_registry }}/hosts.toml"
+        mode: '0644'
+
+    # ============================================
+    # Step 7: Update containerd config for global snapshotter
+    # ============================================
+    - name: Generate fresh containerd config and apply nydus settings
+      # Same pattern as install-stargz.yml: fresh default + targeted seds to avoid duplicate keys
+      shell: |
+        cp /etc/containerd/config.toml /etc/containerd/config.toml.backup-nydus
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/snapshotter = "overlayfs"/snapshotter = "nydus"/' /etc/containerd/config.toml
+        sed -i 's/disable_snapshot_annotations = true/disable_snapshot_annotations = false/' /etc/containerd/config.toml
+        sed -i 's/config_path = ""/config_path = "\/etc\/containerd\/certs.d"/' /etc/containerd/config.toml
+
+    - name: Append nydus proxy plugin to containerd config
+      # Use echo to avoid YAML linter false-positives on TOML [section] brackets
+      shell: |
+        echo '' >> /etc/containerd/config.toml
+        echo '[proxy_plugins.nydus]' >> /etc/containerd/config.toml
+        echo '  type = "snapshot"' >> /etc/containerd/config.toml
+        echo '  address = "/run/containerd-nydus/containerd-nydus-grpc.sock"' >> /etc/containerd/config.toml
+
+    - name: Re-add nvidia runtime after containerd config overwrite
+      shell: nvidia-ctk runtime configure --runtime=containerd --set-as-default
+      when: inventory_hostname in groups['gpu_workers']
+      ignore_errors: yes
+
+    - name: Patch nvidia drop-in to use nydus snapshotter
+      shell: |
+        if [ -f /etc/containerd/conf.d/99-nvidia.toml ]; then
+          sed -i 's/snapshotter = "overlayfs"/snapshotter = "nydus"/' /etc/containerd/conf.d/99-nvidia.toml
+        fi
+      when: inventory_hostname in groups['gpu_workers']
+      ignore_errors: yes
+
+    # ============================================
+    # Step 8: Configure kubelet image-service-endpoint for CRI keychain
+    # ============================================
+    - name: Set single clean KUBELET_KUBEADM_ARGS with nydus image-service-endpoint
+      shell: |
+        grep -v 'KUBELET_KUBEADM_ARGS' /var/lib/kubelet/kubeadm-flags.env > /tmp/kubelet-flags.tmp || true
+        echo 'KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock --image-service-endpoint=unix:///run/containerd-nydus/containerd-nydus-grpc.sock"' >> /tmp/kubelet-flags.tmp
+        mv /tmp/kubelet-flags.tmp /var/lib/kubelet/kubeadm-flags.env
+
+    - name: Restart kubelet to apply image-service-endpoint
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: Wait for kubelet to be ready
+      pause:
+        seconds: 10
+
+    # ============================================
+    # Step 9: Start services
+    # ============================================
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Wait for containerd socket
+      wait_for:
+        path: /run/containerd/containerd.sock
+        state: present
+        timeout: 30
+
+    - name: Start nydus-snapshotter
+      systemd:
+        name: nydus-snapshotter
+        state: started
+        enabled: yes
+
+    - name: Wait for services
+      pause:
+        seconds: 5
+
+    - name: Verify nydus-snapshotter is running
+      shell: systemctl status nydus-snapshotter --no-pager
+      register: nydus_status
+
+    - name: Show status
+      debug:
+        msg: "{{ nydus_status.stdout_lines }}"
+
+
+# ============================================
+# Create Kubernetes secrets for authentication
+# ============================================
+- name: Setup Kubernetes secrets for Harbor
+  hosts: master
+  become: yes
+  vars:
+    harbor_registry: "harbor.example.com"
+    harbor_username: "admin"
+    harbor_password: "CHANGE_ME"
+  tasks:
+    - name: Create harbor-creds secret in namespaces
+      shell: |
+        for ns in default kube-system; do
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf create secret docker-registry harbor-creds \
+            --docker-server=https://{{ harbor_registry }} \
+            --docker-username={{ harbor_username }} \
+            --docker-password={{ harbor_password }} \
+            --docker-email=admin@example.com \
+            -n $ns \
+            --dry-run=client -o yaml | kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -
+        done
+
+    - name: Patch default service account
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf patch serviceaccount default \
+          -n default \
+          -p '{"imagePullSecrets":[{"name":"harbor-creds"}]}'
+
+    - name: Display completion
+      debug:
+        msg: |
+          ✓ Nydus installed with CRI-based authentication!
+          
+          Configuration:
+          - NO hardcoded credentials in config files
+          - CRI keychain enabled in /etc/nydus/config.toml
+          - Kubernetes secret 'harbor-creds' created
+          
+          Test with:
+            kubectl run test-nydus --image={{ harbor_registry }}/nydus/jupyter-pytorch-cuda-full:v1.9.2-nydus --restart=Never
+            kubectl get pod test-nydus -w

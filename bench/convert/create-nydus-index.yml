@@ -1,0 +1,85 @@
+---
+# Convert OCI image to Nydus format using nerdctl image convert
+# nerdctl has built-in Nydus support via --nydus flag (requires nydus-image binary)
+#
+# Nydus: content-addressable RAFS format with 4MB chunk lazy loading
+# Ref: https://github.com/containerd/nerdctl/blob/main/docs/image-lazypull.md
+#
+# Usage: ansible-playbook -i hosts.ini create-nydus-index.yml
+
+- name: Convert OCI image to Nydus and push to Harbor
+  hosts: buildhost
+  become: yes
+  vars:
+    source_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2"
+    target_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-nydus"
+    harbor_registry: "harbor.example.com"
+    harbor_username: "admin"
+    harbor_password: "CHANGE_ME"
+    nydus_version: "2.2.0"
+
+  tasks:
+    - name: Install nerdctl if not present
+      shell: |
+        if [ -x /usr/local/bin/nerdctl ]; then
+          echo "nerdctl already installed"
+          exit 0
+        fi
+        cd /tmp
+        wget -q https://github.com/containerd/nerdctl/releases/download/v2.2.1/nerdctl-2.2.1-linux-amd64.tar.gz
+        tar -xzf nerdctl-2.2.1-linux-amd64.tar.gz
+        mv nerdctl /usr/local/bin/
+        chmod +x /usr/local/bin/nerdctl
+        rm -f nerdctl-2.2.1-linux-amd64.tar.gz
+        echo "nerdctl installed"
+
+    - name: Install nydus-image binary if not present
+      # nerdctl --nydus requires nydus-image binary for layer conversion
+      shell: |
+        if [ -x /usr/local/bin/nydus-image ]; then
+          echo "nydus-image already installed"
+          exit 0
+        fi
+        cd /tmp
+        wget -q https://github.com/dragonflyoss/nydus/releases/download/v{{ nydus_version }}/nydus-static-v{{ nydus_version }}-linux-amd64.tgz
+        mkdir -p /tmp/nydus-static
+        tar -xzf nydus-static-v{{ nydus_version }}-linux-amd64.tgz -C /tmp/nydus-static
+        cp /tmp/nydus-static/nydus-static/nydus-image /usr/local/bin/
+        chmod +x /usr/local/bin/nydus-image
+        rm -rf /tmp/nydus-static /tmp/nydus-static-v{{ nydus_version }}-linux-amd64.tgz
+        echo "nydus-image v{{ nydus_version }} installed"
+
+    - name: Login to Harbor with nerdctl
+      shell: echo "{{ harbor_password }}" | nerdctl login -u {{ harbor_username }} --password-stdin {{ harbor_registry }}
+
+    - name: Pull source OCI image
+      shell: nerdctl pull {{ source_image }}
+      register: pull_result
+
+    - name: Convert to Nydus
+      # --nydus: convert to Nydus RAFS format
+      # --oci: output OCI-compatible manifest (required by Harbor)
+      # --nydus-builder-path: explicit path to nydus-image binary
+      shell: nerdctl image convert --nydus --oci --nydus-builder-path /usr/local/bin/nydus-image {{ source_image }} {{ target_image }}
+      register: convert_result
+
+    - name: Push Nydus image to Harbor
+      shell: nerdctl push {{ target_image }}
+      register: push_result
+
+    - name: Display results
+      debug:
+        msg:
+          - "========================================"
+          - "Nydus Conversion Results"
+          - "========================================"
+          - "Source: {{ source_image }}"
+          - "Target: {{ target_image }}"
+          - ""
+          - "Pull:    {{ 'SUCCESS' if pull_result.rc == 0 else 'FAILED' }}"
+          - "Convert: {{ 'SUCCESS' if convert_result.rc == 0 else 'FAILED' }}"
+          - "Push:    {{ 'SUCCESS' if push_result.rc == 0 else 'FAILED' }}"
+          - ""
+          - "Next steps:"
+          - "1. Install Nydus snapshotter: ansible-playbook -i hosts.ini install-nydus.yml"
+          - "2. Run test:                  ansible-playbook -i hosts.ini test-nydus.yml"

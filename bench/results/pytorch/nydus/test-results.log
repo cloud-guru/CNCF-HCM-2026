@@ -1,0 +1,41 @@
+========================================
+Nydus Lazy Loading Test Results
+========================================
+Timestamp: 2026-03-09T06:05:40Z
+Test Image: harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-nydus
+Pod Name: test-nydus
+Node: worker-5
+
+========================================
+Startup Time Measurement
+========================================
+pod/test-nydus created
+pod/test-nydus condition met
+=== TIMING ===
+Start: 1773051836.092200870
+End: 1773051851.497703203
+Duration: 15.41 seconds
+
+=== POD EVENTS ===
+Events:
+  Type    Reason   Age   From     Message
+  ----    ------   ----  ----     -------
+  Normal  Pulling  15s   kubelet  Pulling image "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-nydus"
+  Normal  Pulled   14s   kubelet  Successfully pulled image "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-nydus" in 839ms (839ms including waiting). Image size: 5027692298 bytes.
+  Normal  Created  14s   kubelet  Created container: test-nydus
+  Normal  Started  14s   kubelet  Started container test-nydus
+
+========================================
+What This Measures
+========================================
+• Image pull (Nydus lazy loading - only metadata downloaded)
+• Container creation
+• Jupyter server initialization
+• Readiness probe success (HTTP /api endpoint)
+
+With Nydus: Chunks loaded on-demand as Jupyter needs them
+Without Nydus: Must download full 9GB before container starts
+
+========================================
+Test Status: PASSED ✓
+========================================

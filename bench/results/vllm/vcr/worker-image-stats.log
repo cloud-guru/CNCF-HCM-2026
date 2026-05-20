@@ -1,0 +1,12 @@
+# BEGIN lab3
+Worker: lab3
+Containerd content store: 380M	/var/lib/containerd/io.containerd.content.v1.content/
+# END lab3
+# BEGIN lab4
+Worker: lab4
+Containerd content store: 9.3G	/var/lib/containerd/io.containerd.content.v1.content/
+# END lab4
+# BEGIN lab2
+Worker: lab2
+Containerd content store: 380M	/var/lib/containerd/io.containerd.content.v1.content/
+# END lab2

@@ -1,0 +1,9 @@
+========================================
+PyTorch Import Test (Traditional OCI)
+========================================
+PyTorch version: 2.5.1+cu124
+Import time: 2.74 seconds
+
+Status: PASSED ✓
+With traditional OCI, all PyTorch libraries were downloaded during image pull.
+No on-demand loading - everything already present.

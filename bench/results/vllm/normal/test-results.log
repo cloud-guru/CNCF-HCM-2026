@@ -1,0 +1,35 @@
+========================================
+Normal OCI vLLM Pull Test Results
+========================================
+Timestamp: 2026-03-04T07:00:28Z
+Image: harbor.example.com/myproject/vllm-openai:v0.12.0
+Pod: test-normal-vllm
+Node: worker-4
+
+========================================
+Startup Time Measurement
+========================================
+pod/test-normal-vllm created
+pod/test-normal-vllm condition met
+=== TIMING ===
+Duration: 350.45 seconds
+
+=== POD EVENTS ===
+Events:
+  Type     Reason     Age                From     Message
+  ----     ------     ----               ----     -------
+  Normal   Pulling    5m49s              kubelet  Pulling image "harbor.example.com/myproject/vllm-openai:v0.12.0"
+  Normal   Pulled     106s               kubelet  Successfully pulled image "harbor.example.com/myproject/vllm-openai:v0.12.0" in 4m2.427s (4m2.427s including waiting). Image size: 8931754811 bytes.
+  Normal   Created    106s               kubelet  Created container: test-normal-vllm
+  Normal   Started    106s               kubelet  Started container test-normal-vllm
+  Warning  Unhealthy  10s (x8 over 70s)  kubelet  Readiness probe failed: Get "http://10.244.3.22:8000/health": dial tcp 10.244.3.22:8000: connect: connection refused
+
+========================================
+What This Measures
+========================================
+• Image pull (Traditional OCI - downloads ENTIRE ~8.4GB image before starting)
+• Container creation
+• vLLM model loading
+• Readiness probe success (HTTP /health:8000)
+
+Status: PASSED

@@ -1,0 +1,43 @@
+========================================
+Normal OCI Image Pull Test Results
+========================================
+Timestamp: 2026-03-04T07:00:28Z
+Test Image: external-registry.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2
+Pod Name: test-normal
+Node: worker-2
+Image Size: 3877087628 bytes.
+
+========================================
+Startup Time Measurement
+========================================
+pod/test-normal created
+pod/test-normal condition met
+=== TIMING ===
+Start: 1772617266.650962047
+End: 1772617402.079098056
+Duration: 135.43 seconds
+
+=== POD EVENTS ===
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  2m15s  default-scheduler  Successfully assigned default/test-normal to worker-2
+  Normal  Pulling    2m15s  kubelet            Pulling image "external-registry.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2"
+  Normal  Pulled     12s    kubelet            Successfully pulled image "external-registry.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2" in 2m3.153s (2m3.153s including waiting). Image size: 3877087628 bytes.
+  Normal  Created    12s    kubelet            Created container: test-normal
+  Normal  Started    12s    kubelet            Started container test-normal
+
+========================================
+What This Measures
+========================================
+• Image pull (Traditional OCI - downloads ENTIRE image before starting)
+• Container creation
+• Jupyter server initialization
+• Readiness probe success (HTTP /api endpoint)
+
+Traditional OCI: Must download full 9GB before container can start
+With Nydus: Only metadata (~3.5GB) + on-demand chunks
+
+========================================
+Test Status: PASSED ✓
+========================================

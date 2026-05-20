@@ -1,0 +1,24 @@
+========================================
+Stargz Lazy Loading Test Results
+========================================
+Timestamp: 2026-03-03T06:25:08Z
+Image: external-registry.example.com/108942-public69/jupyter-pytorch-cuda-full:v1.9.2-estargz
+Node: worker-2
+
+pod/test-stargz created
+pod/test-stargz condition met
+=== TIMING ===
+Duration: 110.81 seconds
+
+=== POD EVENTS ===
+Events:
+  Type     Reason     Age                From               Message
+  ----     ------     ----               ----               -------
+  Normal   Scheduled  110s               default-scheduler  Successfully assigned default/test-stargz to worker-2
+  Normal   Pulling    97s                kubelet            Pulling image "external-registry.example.com/108942-public69/jupyter-pytorch-cuda-full:v1.9.2-estargz"
+  Normal   Pulled     94s                kubelet            Successfully pulled image "external-registry.example.com/108942-public69/jupyter-pytorch-cuda-full:v1.9.2-estargz" in 2.66s (2.66s including waiting). Image size: 3910197920 bytes.
+  Normal   Created    94s                kubelet            Created container: test-stargz
+  Normal   Started    94s                kubelet            Started container test-stargz
+  Warning  Unhealthy  6s (x17 over 81s)  kubelet            Readiness probe failed: Get "http://10.244.2.43:8888/api": dial tcp 10.244.2.43:8888: connect: connection refused
+
+Status: PASSED

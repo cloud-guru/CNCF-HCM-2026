@@ -1,0 +1,315 @@
+---
+# Test Nydus Lazy Loading with vLLM image
+# Image: harbor.example.com/myproject/vllm-openai:v0.12.0-nydus
+# Requires: GPU node (lab4), Nydus installed (install-nydus.yml)
+#
+# Usage: ansible-playbook -i hosts.ini test-nydus-vllm.yml
+
+- name: Cleanup before testing
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-nydus-vllm"
+  tasks:
+    - name: Delete existing test pod
+      shell: kubectl delete pod {{ test_pod_name }} --ignore-not-found=true
+      changed_when: false
+
+    - name: Wait for pod deletion
+      pause:
+        seconds: 5
+
+- name: Purge image cache on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "harbor.example.com/myproject/vllm-openai:v0.12.0-nydus"
+  tasks:
+    - name: List images to find Nydus vllm image
+      shell: ctr -n k8s.io images ls | grep "{{ test_image }}" || true
+      register: image_check
+      changed_when: false
+
+    - name: Remove Nydus image from containerd
+      shell: ctr -n k8s.io images rm "{{ test_image }}"
+      when: image_check.stdout != ""
+      ignore_errors: yes
+
+    - name: Remove all Nydus snapshots from containerd
+      shell: |
+        ctr -n k8s.io snapshots --snapshotter nydus ls | tail -n +2 | awk '{print $1}' | while read snap; do
+          if [ -n "$snap" ]; then
+            ctr -n k8s.io snapshots --snapshotter nydus rm "$snap" 2>/dev/null || true
+          fi
+        done
+      ignore_errors: yes
+
+    - name: Remove content with stale nydus GC references
+      shell: |
+        ctr -n k8s.io content ls | grep "containerd.io/gc.ref.snapshot.nydus" | awk '{print $1}' | while read digest; do
+          ctr -n k8s.io content rm "$digest" 2>/dev/null || true
+        done
+      ignore_errors: yes
+
+    - name: Stop nydus-snapshotter to unmount FUSE filesystems
+      systemd:
+        name: nydus-snapshotter
+        state: stopped
+
+    - name: Wait for FUSE unmounts
+      pause:
+        seconds: 3
+
+    - name: Kill any remaining nydusd processes
+      shell: pkill -9 nydusd || true
+      ignore_errors: yes
+
+    - name: Force unmount all stale FUSE/nydus mounts
+      shell: |
+        for mnt in $(mount | grep -E "rafs|nydus|fuse" | awk '{print $3}'); do
+          umount -f "$mnt" 2>/dev/null || true
+          umount -l "$mnt" 2>/dev/null || true
+        done
+        for dir in /var/lib/containerd-nydus/snapshots/*/mnt; do
+          [ -d "$dir" ] && { umount -f "$dir" 2>/dev/null; umount -l "$dir" 2>/dev/null; } || true
+        done
+      ignore_errors: yes
+
+    - name: Clean up Nydus cache directory (full wipe + recreate)
+      shell: |
+        rm -rf /var/lib/containerd-nydus/cache
+        mkdir -p /var/lib/containerd-nydus/cache
+      ignore_errors: yes
+
+    - name: Verify cache is empty
+      shell: find /var/lib/containerd-nydus/cache -type f | wc -l
+      register: cache_check
+      changed_when: false
+
+    - name: Fail if cache not empty
+      fail:
+        msg: "Cache still has {{ cache_check.stdout }} files after cleanup!"
+      when: cache_check.stdout | int > 0
+
+    - name: Remove snapshot directories (now that FUSE is unmounted)
+      shell: rm -rf /var/lib/containerd-nydus/snapshots/*
+      ignore_errors: yes
+
+    - name: Remove config and socket directories
+      shell: |
+        rm -rf /var/lib/containerd-nydus/config/*
+        rm -rf /var/lib/containerd-nydus/socket/*
+        rm -rf /var/lib/containerd-nydus/logs/*
+        rm -f /var/lib/containerd-nydus/*.db
+      ignore_errors: yes
+
+    - name: Wipe containerd metadata DB to clear stale nydus snapshot references
+      shell: |
+        systemctl stop containerd
+        rm -rf /var/lib/containerd/io.containerd.metadata.v1.bolt/
+        systemctl start containerd
+      ignore_errors: yes
+
+    - name: Restart nydus-snapshotter with clean state
+      systemd:
+        name: nydus-snapshotter
+        state: restarted
+
+    - name: Wait for nydus socket
+      wait_for:
+        path: /run/containerd-nydus/containerd-nydus-grpc.sock
+        timeout: 30
+
+    - name: Restart containerd to clear metadata cache
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Wait for containerd
+      pause:
+        seconds: 5
+
+- name: Test Nydus lazy loading with vLLM
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_image: "harbor.example.com/myproject/vllm-openai:v0.12.0-nydus"
+    image_pull_secret: "harbor-creds"
+    test_pod_name: "test-nydus-vllm"
+    log_dir: "./nydus-vllm-test-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Create log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: no
+
+    - name: Export log_dir for later plays
+      set_fact:
+        nydus_vllm_log_dir: "{{ log_dir }}"
+
+    - name: Wait for Cilium to be ready after containerd restart
+      pause:
+        seconds: 60
+
+    - name: Measure pod startup time
+      shell: |
+        START=$(date +%s.%N)
+        kubectl run {{ test_pod_name }} \
+          --image={{ test_image }} \
+          --overrides='{
+            "spec": {
+              "nodeName": "worker-4",
+              "imagePullSecrets": [{"name": "{{ image_pull_secret }}"}],
+              "volumes": [{"name": "models", "persistentVolumeClaim": {"claimName": "llama-models-pvc"}}],
+              "containers": [{
+                "name": "{{ test_pod_name }}",
+                "image": "{{ test_image }}",
+                "command": ["vllm", "serve", "/models/meta-llama/Meta-Llama-3-8B", "--host=0.0.0.0", "--port=8000", "--served-model-name", "meta-llama/Meta-Llama-3-8B", "--load-format", "runai_streamer", "--disable-log-requests"],
+                "volumeMounts": [{"name": "models", "mountPath": "/models"}],
+                "resources": {
+                  "limits": {"nvidia.com/gpu": "1"},
+                  "requests": {"nvidia.com/gpu": "1"}
+                },
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/health",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10,
+                  "timeoutSeconds": 5,
+                  "successThreshold": 1,
+                  "failureThreshold": 60
+                }
+              }]
+            }
+          }'
+
+        if kubectl wait --for=condition=Ready pod/{{ test_pod_name }} --timeout=600s; then
+          END=$(date +%s.%N)
+          DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+          echo "=== TIMING ==="
+          echo "Duration: ${DURATION} seconds"
+          echo ""
+          echo "=== POD EVENTS ==="
+          kubectl describe pod {{ test_pod_name }} | grep -A 20 "Events:"
+          exit 0
+        else
+          echo "Pod failed to start within 600 seconds"
+          kubectl describe pod {{ test_pod_name }} | tail -30
+          exit 1
+        fi
+      register: startup_time
+      async: 700
+      poll: 15
+      ignore_errors: yes
+
+    - name: Get node where pod is running
+      shell: kubectl get pod {{ test_pod_name }} -o jsonpath='{.spec.nodeName}'
+      register: pod_node
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Save test results
+      copy:
+        content: |
+          ========================================
+          Nydus vLLM Test Results
+          ========================================
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Image: {{ test_image }}
+          Pod: {{ test_pod_name }}
+          Node: {{ pod_node.stdout | default('N/A') }}
+
+          {{ startup_time.stdout }}
+
+          Status: {{ 'PASSED' if startup_time.rc == 0 else 'FAILED' }}
+        dest: "{{ log_dir }}/test-results.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display timing results
+      debug:
+        msg:
+          - "========================================"
+          - "Nydus vLLM Startup Time"
+          - "========================================"
+          - "{{ startup_time.stdout_lines }}"
+          - "{{ 'PASSED' if startup_time.rc == 0 else 'FAILED' }}"
+          - "Logs: {{ log_dir }}/"
+
+- name: Test vLLM inference endpoint
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-nydus-vllm"
+  tasks:
+    - name: Send Hello prompt to vLLM chat endpoint
+      shell: |
+        START=$(date +%s.%N)
+        OUTPUT=$(kubectl exec {{ test_pod_name }} -- curl -s -X POST http://localhost:8000/v1/completions \
+          -H "Content-Type: application/json" \
+          -d '{"model": "meta-llama/Meta-Llama-3-8B", "prompt": "Hello", "max_tokens": 50}')
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+        echo "$OUTPUT"
+        echo "Inference time: ${DURATION} seconds"
+      register: inference_test
+      ignore_errors: yes
+
+    - name: Save inference test to log
+      copy:
+        content: |
+          ========================================
+          vLLM Inference Endpoint Test (Nydus)
+          ========================================
+          {{ inference_test.stdout }}
+
+          Status: {{ 'PASSED' if inference_test.rc == 0 else 'FAILED' }}
+        dest: "{{ hostvars[groups['master'][0]]['nydus_vllm_log_dir'] }}/inference-test.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display inference test result
+      debug:
+        msg:
+          - "vLLM /v1/models: {{ 'PASSED' if inference_test.rc == 0 else 'FAILED' }}"
+          - "{{ inference_test.stdout_lines }}"
+
+- name: Check Nydus cache on workers
+  hosts: workers
+  become: yes
+  vars:
+    log_dir: "{{ hostvars[groups['master'][0]]['nydus_vllm_log_dir'] }}"
+  tasks:
+    - name: Check cache size
+      shell: du -sh /var/lib/containerd-nydus/cache 2>/dev/null || echo "0 cache"
+      register: cache_size
+      changed_when: false
+
+    - name: Count cached chunks
+      shell: find /var/lib/containerd-nydus/cache -type f 2>/dev/null | wc -l
+      register: chunk_count
+      changed_when: false
+
+    - name: Save worker stats
+      blockinfile:
+        path: "{{ log_dir }}/worker-cache-stats.log"
+        marker: "# {mark} {{ inventory_hostname }}"
+        create: yes
+        block: |
+          Worker: {{ inventory_hostname }}
+          Cache size: {{ cache_size.stdout }}
+          Cached chunks: {{ chunk_count.stdout }}
+      delegate_to: localhost
+      become: no
+
+    - name: Display worker status
+      debug:
+        msg:
+          - "{{ inventory_hostname }}: cache={{ cache_size.stdout }}, chunks={{ chunk_count.stdout }}"

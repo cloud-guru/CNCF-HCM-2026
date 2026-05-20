@@ -1,0 +1,27 @@
+========================================
+SOCI Test Results
+========================================
+Date: 2026-03-03T06:25:08Z
+Image: harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-soci
+SOCI Version: 0.12.1
+
+pod/test-soci created
+pod/test-soci condition met
+===================================
+SOCI Lazy Loading Performance
+===================================
+Ready time: 28.21 seconds
+
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  28s   default-scheduler  Successfully assigned default/test-soci to worker-3
+  Normal  Pulling    17s   kubelet            Pulling image "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-soci"
+  Normal  Pulled     11s   kubelet            Successfully pulled image "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-soci" in 5.227s (5.227s including waiting). Image size: 3877087026 bytes.
+  Normal  Created    11s   kubelet            Created container: test-soci
+  Normal  Started    11s   kubelet            Started container test-soci
+
+PyTorch version: 2.5.1+cu124
+PyTorch import time: 9.24 seconds
+
+Status: PASSED

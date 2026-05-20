@@ -1,0 +1,7 @@
+========================================
+PyTorch Import Test (Stargz On-Demand Loading)
+========================================
+PyTorch version: 2.5.1+cu124
+Import time: 79.92 seconds
+
+Status: PASSED

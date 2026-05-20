@@ -1,0 +1,278 @@
+---
+# Test Stargz Lazy Loading Performance
+# Usage: ansible-playbook -i hosts.ini test-stargz.yml
+#
+# Prerequisites:
+# - install-stargz.yml must have run on worker nodes
+# - Image must be converted: ansible-playbook -i hosts.ini create-stargz-index.yml
+
+- name: Cleanup before testing
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-stargz"
+  tasks:
+    - name: Delete existing test pod
+      shell: kubectl delete pod {{ test_pod_name }} --ignore-not-found=true
+      changed_when: false
+
+    - name: Wait for pod deletion
+      pause:
+        seconds: 5
+
+- name: Purge image cache on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-estargz"
+  tasks:
+    - name: Cordon worker to prevent pod scheduling during cleanup
+      shell: kubectl cordon {{ ansible_hostname }}
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+    - name: Remove test image refs from containerd
+      shell: |
+        ctr -n k8s.io images rm {{ test_image }} 2>/dev/null || true
+        ctr -n k8s.io images ls | grep estargz | awk '{print $1}' | xargs -r ctr -n k8s.io images rm 2>/dev/null || true
+
+    - name: Remove all stargz snapshots from containerd metadata
+      # Must do BEFORE stopping services so ctr can still talk to containerd
+      shell: |
+        ctr -n k8s.io snapshots --snapshotter stargz ls 2>/dev/null | tail -n +2 | awk '{print $1}' | while read snap; do
+          if [ -n "$snap" ]; then
+            ctr -n k8s.io snapshots --snapshotter stargz rm "$snap" 2>/dev/null || true
+          fi
+        done
+
+    - name: Remove content blobs with stale stargz GC references
+      # Without this, containerd tries to re-unpack into stargz and hits "already exists"
+      shell: |
+        ctr -n k8s.io content ls 2>/dev/null | grep "containerd.io/gc.ref.snapshot.stargz" | awk '{print $1}' | while read digest; do
+          if [ -n "$digest" ]; then
+            ctr -n k8s.io content rm "$digest" 2>/dev/null || true
+          fi
+        done
+
+    - name: Stop services before wiping stargz data directories
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - containerd
+        - stargz-snapshotter
+
+    - name: Wipe stargz data directories
+      shell: rm -rf /var/lib/containerd-stargz-grpc/snapshots/ /var/lib/containerd-stargz-grpc/blobstore/
+
+    - name: Start stargz snapshotter
+      systemd:
+        name: stargz-snapshotter
+        state: started
+
+    - name: Start containerd
+      systemd:
+        name: containerd
+        state: started
+
+    - name: Start kubelet
+      systemd:
+        name: kubelet
+        state: started
+
+    - name: Wait for stargz socket to be ready
+      wait_for:
+        path: /run/containerd-stargz-grpc/containerd-stargz-grpc.sock
+        timeout: 30
+
+    - name: Wait for node to be Ready before uncordon
+      shell: kubectl wait node {{ ansible_hostname }} --for=condition=Ready --timeout=120s
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+    - name: Uncordon worker
+      shell: kubectl uncordon {{ ansible_hostname }}
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+    - name: Verify stargz plugin is available
+      shell: ctr plugins ls | grep stargz
+      register: plugin_check
+      changed_when: false
+
+    - name: Display cleanup status
+      debug:
+        msg:
+          - "{{ inventory_hostname }}: stargz cleanup complete"
+          - "  Plugin: {{ plugin_check.stdout_lines[0] if plugin_check.stdout_lines else 'not found' }}"
+
+- name: Test Stargz lazy loading
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-estargz"
+    test_pod_name: "test-stargz"
+    log_dir: "./stargz-test-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Create log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: no
+
+    - name: Export log_dir so worker-cache play uses the same folder
+      set_fact:
+        stargz_log_dir: "{{ log_dir }}"
+
+    - name: Measure pod startup time with Stargz
+      shell: |
+        START=$(date +%s.%N)
+        kubectl run {{ test_pod_name }} \
+          --image={{ test_image }} \
+          --overrides='{
+            "spec": {
+              "imagePullSecrets": [{"name": "harbor-creds"}],
+              "containers": [{
+                "name": "{{ test_pod_name }}",
+                "image": "{{ test_image }}",
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/api",
+                    "port": 8888
+                  },
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 5,
+                  "timeoutSeconds": 5,
+                  "successThreshold": 1,
+                  "failureThreshold": 60
+                }
+              }]
+            }
+          }'
+
+        if kubectl wait --for=condition=Ready pod/{{ test_pod_name }} --timeout=600s; then
+          END=$(date +%s.%N)
+          DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+          echo "=== TIMING ==="
+          echo "Duration: ${DURATION} seconds"
+          echo ""
+          echo "=== POD EVENTS ==="
+          kubectl describe pod {{ test_pod_name }} | grep -A 20 "Events:"
+          exit 0
+        else
+          echo "Pod failed to start within 600 seconds"
+          kubectl describe pod {{ test_pod_name }} | tail -30
+          exit 1
+        fi
+      register: startup_time
+      ignore_errors: yes
+
+    - name: Get node where pod is running
+      shell: kubectl get pod {{ test_pod_name }} -o jsonpath='{.spec.nodeName}'
+      register: pod_node
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Save test results
+      copy:
+        content: |
+          ========================================
+          Stargz Lazy Loading Test Results
+          ========================================
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Image: {{ test_image }}
+          Node: {{ pod_node.stdout | default('N/A') }}
+
+          {{ startup_time.stdout }}
+
+          Status: {{ 'PASSED' if startup_time.rc == 0 else 'FAILED' }}
+        dest: "{{ log_dir }}/test-results.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display timing results
+      debug:
+        msg:
+          - "========================================"
+          - "Stargz Application Startup Time"
+          - "========================================"
+          - "{{ startup_time.stdout_lines }}"
+          - "{% if startup_time.rc == 0 %}PASSED{% else %}FAILED{% endif %}"
+          - "Logs saved to: {{ log_dir }}/"
+
+- name: Test PyTorch import with Stargz
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-stargz"
+  tasks:
+    - name: Import PyTorch to trigger Stargz on-demand loading
+      shell: |
+        START=$(date +%s.%N)
+        OUTPUT=$(kubectl exec {{ test_pod_name }} -- python3 -c "import torch; print('PyTorch version:', torch.__version__)")
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+        echo "$OUTPUT"
+        echo "Import time: ${DURATION} seconds"
+      register: pytorch_test
+      ignore_errors: yes
+
+    - name: Save PyTorch test to log
+      copy:
+        content: |
+          ========================================
+          PyTorch Import Test (Stargz On-Demand Loading)
+          ========================================
+          {{ pytorch_test.stdout }}
+
+          Status: {{ 'PASSED' if pytorch_test.rc == 0 else 'FAILED' }}
+        dest: "{{ hostvars[groups['master'][0]]['stargz_log_dir'] }}/pytorch-test.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display PyTorch test result
+      debug:
+        msg:
+          - "PyTorch import: {{ 'PASSED' if pytorch_test.rc == 0 else 'FAILED' }}"
+          - "{{ pytorch_test.stdout }}"
+
+- name: Check Stargz cache usage on workers
+  hosts: workers
+  become: yes
+  vars:
+    log_dir: "{{ hostvars[groups['master'][0]]['stargz_log_dir'] }}"
+  tasks:
+    - name: Check stargz cache size
+      shell: du -sh /var/lib/containerd-stargz-grpc/ 2>/dev/null || echo "N/A"
+      register: cache_size
+      changed_when: false
+
+    - name: Count active stargz snapshots
+      shell: ctr -n k8s.io snapshots --snapshotter stargz ls 2>/dev/null | tail -n +2 | wc -l
+      register: snapshot_count
+      changed_when: false
+
+    - name: Save worker stats
+      blockinfile:
+        path: "{{ log_dir }}/worker-cache-stats.log"
+        marker: "# {mark} {{ inventory_hostname }}"
+        create: yes
+        block: |
+          Worker: {{ inventory_hostname }}
+          Stargz cache: {{ cache_size.stdout }}
+          Active snapshots: {{ snapshot_count.stdout }}
+      delegate_to: localhost
+      become: no
+
+    - name: Display worker status
+      debug:
+        msg:
+          - "{{ inventory_hostname }}: cache={{ cache_size.stdout }}, snapshots={{ snapshot_count.stdout }}"

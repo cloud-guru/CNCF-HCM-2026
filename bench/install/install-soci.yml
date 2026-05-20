@@ -1,0 +1,228 @@
+---
+# Install SOCI Snapshotter v0.12.1 with proper registry integration
+# This ensures workers automatically pull SOCI indices from registry
+# Usage: ansible-playbook -i hosts.ini install-soci.yml
+
+- name: Install SOCI snapshotter on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    soci_version: "0.12.1"
+    harbor_username: "admin"
+    harbor_password: "CHANGE_ME"
+  
+  tasks:
+    - name: Download and install SOCI binaries
+      shell: |
+        cd /tmp
+        wget -q https://github.com/awslabs/soci-snapshotter/releases/download/v{{ soci_version }}/soci-snapshotter-{{ soci_version }}-linux-amd64.tar.gz
+        tar -xzf soci-snapshotter-{{ soci_version }}-linux-amd64.tar.gz
+        
+        # Install binaries
+        mv soci-snapshotter-grpc /usr/local/bin/
+        mv soci /usr/local/bin/
+        chmod +x /usr/local/bin/soci-snapshotter-grpc
+        chmod +x /usr/local/bin/soci
+        
+        rm -f soci-snapshotter-{{ soci_version }}-linux-amd64.tar.gz
+
+    - name: Create SOCI directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/soci-snapshotter-grpc
+        - /var/lib/soci-snapshotter-grpc
+        - /run/soci-snapshotter-grpc
+
+    - name: Configure SOCI snapshotter with registry credentials
+      copy:
+        content: |
+          # SOCI v0.12.1 configuration with automatic index pulling from registry
+          
+          # Root directory for SOCI metadata and cache
+          root = "/var/lib/soci-snapshotter-grpc"
+          
+          # Disable CRI keychain initially - use direct auth
+          disable_verification = false
+          
+          # Allow SOCI to automatically fetch indices from registry
+          allow_rpull = true
+          
+          # Min layer size for using SOCI (10MB)
+          min_layer_size = 10485760
+          
+          # Background fetching configuration
+          [background_fetch]
+          disable = false
+          silence_period_msec = 10000
+          fetch_period_msec = 500
+          max_parallelism = 10
+          
+          # CRI keychain - act as ImageService proxy between kubelet and containerd
+          [cri_keychain]
+          enable_keychain = true
+          image_service_path = "/run/containerd/containerd.sock"
+
+          # Registry authentication
+          [[resolver.auth]]
+          registry = "harbor.example.com"
+          username = "{{ harbor_username }}"
+          password = "{{ harbor_password }}"
+        dest: /etc/soci-snapshotter-grpc/config.toml
+        mode: '0600'
+
+    - name: Create SOCI systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=SOCI Snapshotter v{{ soci_version }}
+          After=network.target
+          Before=containerd.service
+          
+          [Service]
+          Type=notify
+          ExecStart=/usr/local/bin/soci-snapshotter-grpc \
+            --config /etc/soci-snapshotter-grpc/config.toml \
+            --address /run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock \
+            --root /var/lib/soci-snapshotter-grpc \
+            --log-level debug
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/soci-snapshotter.service
+
+    - name: Start SOCI snapshotter service
+      systemd:
+        name: soci-snapshotter
+        daemon_reload: yes
+        enabled: yes
+        state: started
+
+    - name: Wait for SOCI socket
+      wait_for:
+        path: /run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock
+        timeout: 30
+
+    - name: Configure containerd to use SOCI
+      shell: |
+        # Backup current config
+        cp /etc/containerd/config.toml /etc/containerd/config.toml.backup-soci
+        
+        # Generate fresh config
+        containerd config default > /etc/containerd/config.toml
+        
+        # Set SOCI as default snapshotter
+        sed -i 's/snapshotter = "overlayfs"/snapshotter = "soci"/' /etc/containerd/config.toml
+        
+        # Enable snapshot annotations (required for SOCI)
+        sed -i 's/disable_snapshot_annotations = true/disable_snapshot_annotations = false/' /etc/containerd/config.toml
+        
+        # Add SOCI proxy plugin configuration (check for existing proxy_plugins section)
+        if grep -q "^\[proxy_plugins\]" /etc/containerd/config.toml; then
+          echo "proxy_plugins section exists, adding SOCI under it"
+          sed -i '/^\[proxy_plugins\]/a\  [proxy_plugins.soci]\n    type = "snapshot"\n    address = "/run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock"' /etc/containerd/config.toml
+        else
+          echo "Adding new proxy_plugins section with SOCI"
+          echo '' >> /etc/containerd/config.toml
+          echo '[proxy_plugins]' >> /etc/containerd/config.toml
+          echo '  [proxy_plugins.soci]' >> /etc/containerd/config.toml
+          echo '    type = "snapshot"' >> /etc/containerd/config.toml
+          echo '    address = "/run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock"' >> /etc/containerd/config.toml
+        fi
+
+    - name: Re-add nvidia runtime with soci snapshotter
+      shell: |
+        nvidia-ctk runtime configure --runtime=containerd --set-as-default
+        if [ -f /etc/containerd/conf.d/99-nvidia.toml ]; then
+          sed -i 's/snapshotter = "overlayfs"/snapshotter = "soci"/' /etc/containerd/conf.d/99-nvidia.toml
+        fi
+      when: inventory_hostname in groups['gpu_workers']
+      ignore_errors: yes
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Configure kubelet to use SOCI as CRI image service endpoint
+      # Required for CRI keychain: kubelet must send image pull requests to soci
+      # socket so soci can intercept credentials from the CRI request.
+      lineinfile:
+        path: /var/lib/kubelet/kubeadm-flags.env
+        regexp: '--image-service-endpoint='
+        line: 'KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock --image-service-endpoint=unix:///run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock"'
+      register: kubelet_config
+
+    - name: Restart kubelet to apply image-service-endpoint
+      systemd:
+        name: kubelet
+        state: restarted
+      when: kubelet_config.changed
+
+    - name: Verify SOCI is working
+      shell: |
+        sleep 5
+        ctr plugins ls | grep soci
+      register: plugin_check
+
+    - name: Display status
+      debug:
+        msg:
+          - "{{ inventory_hostname }}: SOCI v{{ soci_version }} installed"
+          - "Plugin: {{ plugin_check.stdout }}"
+          - "Service: active"
+          - ""
+          - "SOCI will now automatically:"
+          - "1. Check registry for SOCI indices when pulling images"
+          - "2. Use lazy loading if index exists"
+          - "3. Fall back to normal pull if no index"
+
+- name: Create SOCI RuntimeClass in Kubernetes
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  tasks:
+    - name: Create SOCI RuntimeClass
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: node.k8s.io/v1
+        kind: RuntimeClass
+        metadata:
+          name: soci
+        handler: soci
+        scheduling:
+          nodeSelector:
+            soci-enabled: "true"
+        EOF
+
+    - name: Label worker nodes for SOCI
+      shell: |
+        {% for worker in groups['workers'] %}
+        kubectl label nodes {{ hostvars[worker]['ansible_hostname'] }} soci-enabled=true --overwrite
+        {% endfor %}
+
+    - name: Verify RuntimeClass
+      shell: kubectl get runtimeclass
+      register: runtimeclass_list
+
+    - name: Display setup complete
+      debug:
+        msg:
+          - "========================================"
+          - "SOCI Installation Complete"
+          - "========================================"
+          - "SOCI Version: 0.12.1"
+          - "Workers: SOCI snapshotter active"
+          - "Registry: Configured for automatic index pull"
+          - "Kubernetes: RuntimeClass 'soci' created"
+          - ""
+          - "{{ runtimeclass_list.stdout }}"
+          - ""
+          - "To use SOCI:"
+          - "1. Create SOCI index: ansible-playbook create-soci-index.yml"
+          - "2. Push index to registry (must support OCI 1.1)"
+          - "3. Deploy pods with: runtimeClassName: soci"

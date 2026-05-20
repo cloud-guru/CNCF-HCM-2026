@@ -1,0 +1,25 @@
+========================================
+SOCI vLLM Test Results
+========================================
+Date: 2026-03-04T07:00:28Z
+Image: harbor.example.com/myproject/vllm-openai:v0.12.0-soci
+Pod: test-soci-vllm
+Node: worker-4
+
+pod/test-soci-vllm created
+pod/test-soci-vllm condition met
+===================================
+SOCI vLLM Lazy Loading Performance
+===================================
+Ready time: 290.48 seconds
+
+Events:
+  Type     Reason     Age                   From     Message
+  ----     ------     ----                  ----     -------
+  Normal   Pulling    4m47s                 kubelet  Pulling image "harbor.example.com/myproject/vllm-openai:v0.12.0-soci"
+  Normal   Pulled     4m37s                 kubelet  Successfully pulled image "harbor.example.com/myproject/vllm-openai:v0.12.0-soci" in 9.982s (9.982s including waiting). Image size: 8931754679 bytes.
+  Normal   Created    4m37s                 kubelet  Created container: test-soci-vllm
+  Normal   Started    4m27s                 kubelet  Started container test-soci-vllm
+  Warning  Unhealthy  50s (x21 over 3m50s)  kubelet  Readiness probe failed: Get "http://10.244.3.207:8000/health": dial tcp 10.244.3.207:8000: connect: connection refused
+
+Status: PASSED

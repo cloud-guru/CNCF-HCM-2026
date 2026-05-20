@@ -1,0 +1,396 @@
+---
+# Comprehensive Container Acceleration Benchmark
+# Runs all 5 technology tests and generates comparison report
+#
+# Usage: ansible-playbook -i hosts.ini run-comprehensive-benchmark.yml
+#
+# Technologies tested:
+# 1. VCR (VNG Container Registry) - External OCI
+# 2. Harbor Internal OCI - Internal traditional OCI  
+# 3. Harbor + Nydus - Lazy loading with Nydus
+# 4. SOCI - AWS lazy loading format
+# 5. Stargz - Google lazy loading format
+
+- name: Initialize comprehensive benchmark
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    benchmark_timestamp: "{{ ansible_date_time.epoch }}"
+    benchmark_dir: "./comprehensive-benchmark-{{ benchmark_timestamp }}"
+    test_images:
+      - name: "jupyter-pytorch"
+        image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2"
+        size: "~5GB"
+      - name: "vllm"
+        image: "harbor.example.com/myproject/vllm-openai:v0.10.0"  
+        size: "~8.4GB"
+  tasks:
+    - name: Create benchmark directory
+      file:
+        path: "{{ benchmark_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: no
+
+    - name: Create benchmark overview
+      copy:
+        content: |
+          ========================================
+          COMPREHENSIVE CONTAINER ACCELERATION BENCHMARK
+          ========================================
+          
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Benchmark ID: {{ benchmark_timestamp }}
+          
+          Test Images:
+          {% for image in test_images %}
+          • {{ image.name }}: {{ image.image }} ({{ image.size }})
+          {% endfor %}
+          
+          Technologies Under Test:
+          1. VCR (VNG Container Registry) - External OCI registry
+          2. Harbor Internal OCI - Internal Harbor with traditional OCI  
+          3. Harbor + Nydus - Lazy loading with Nydus snapshotter
+          4. SOCI - AWS Seekable OCI lazy loading format
+          5. Stargz - Google lazy loading format
+          
+          Metrics Measured:
+          • Image Pull Time - Time to download image metadata/layers
+          • Container Ready Time - Time until pod status = Running  
+          • First Request Latency - Time to handle first application request
+          • PyTorch Import Time - Time to import PyTorch (triggers lazy loading)
+          • Total Data Downloaded - Network bandwidth consumed
+          • Disk Usage - Storage consumed on worker nodes
+          
+          ========================================
+          BENCHMARK EXECUTION LOG
+          ========================================
+          
+        dest: "{{ benchmark_dir }}/benchmark-overview.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display benchmark start
+      debug:
+        msg:
+          - "========================================"
+          - "Starting Comprehensive Benchmark"
+          - "========================================"
+          - "Timestamp: {{ ansible_date_time.iso8601 }}"
+          - "Benchmark ID: {{ benchmark_timestamp }}"
+          - "Results will be saved to: {{ benchmark_dir }}/"
+          - ""
+          - "This will test 5 container acceleration technologies"
+          - "Expected duration: ~45-60 minutes"
+
+- name: Test 1 - VCR (External OCI Registry)
+  hosts: master
+  become: yes 
+  become_user: ubuntu
+  vars:
+    benchmark_dir: "./comprehensive-benchmark-{{ hostvars['localhost']['benchmark_timestamp'] | default(ansible_date_time.epoch) }}"
+  tasks:
+    - name: Log test start
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Starting Test 1: VCR (External OCI Registry)"
+      delegate_to: localhost
+      become: no
+
+    - name: Run VCR test (test-normal.yml with external registry)
+      include: test-normal.yml
+      vars:
+        test_image: "external-registry.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2"
+        test_pod_name: "test-vcr"
+        log_dir: "{{ benchmark_dir }}/vcr-test"
+
+    - name: Copy VCR results to benchmark directory  
+      shell: |
+        if [ -d "normal-test-*" ]; then
+          LATEST_DIR=$(ls -td normal-test-* | head -1)
+          cp -r "$LATEST_DIR" "{{ benchmark_dir }}/vcr-test" 2>/dev/null || true
+        fi
+      delegate_to: localhost
+      become: no
+
+    - name: Log test completion
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Completed Test 1: VCR"
+      delegate_to: localhost
+      become: no
+
+- name: Test 2 - Harbor Internal OCI  
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    benchmark_dir: "./comprehensive-benchmark-{{ hostvars['localhost']['benchmark_timestamp'] | default(ansible_date_time.epoch) }}"
+  tasks:
+    - name: Log test start
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Starting Test 2: Harbor Internal OCI"
+      delegate_to: localhost
+      become: no
+
+    - name: Run Harbor OCI test
+      include: test-harbor-oci.yml
+
+    - name: Copy Harbor OCI results to benchmark directory
+      shell: |
+        if [ -d "harbor-oci-test-*" ]; then
+          LATEST_DIR=$(ls -td harbor-oci-test-* | head -1)  
+          cp -r "$LATEST_DIR" "{{ benchmark_dir }}/harbor-oci-test" 2>/dev/null || true
+        fi
+      delegate_to: localhost
+      become: no
+
+    - name: Log test completion
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Completed Test 2: Harbor OCI"
+      delegate_to: localhost
+      become: no
+
+- name: Test 3 - Harbor + Nydus (Lazy Loading)
+  hosts: master  
+  become: yes
+  become_user: ubuntu
+  vars:
+    benchmark_dir: "./comprehensive-benchmark-{{ hostvars['localhost']['benchmark_timestamp'] | default(ansible_date_time.epoch) }}"
+  tasks:
+    - name: Log test start
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log" 
+        line: "[{{ ansible_date_time.time }}] Starting Test 3: Harbor + Nydus"
+      delegate_to: localhost
+      become: no
+
+    - name: Run Nydus test
+      include: test-nydus.yml
+
+    - name: Copy Nydus results to benchmark directory
+      shell: |
+        if [ -d "nydus-test-*" ]; then
+          LATEST_DIR=$(ls -td nydus-test-* | head -1)
+          cp -r "$LATEST_DIR" "{{ benchmark_dir }}/nydus-test" 2>/dev/null || true
+        fi
+      delegate_to: localhost
+      become: no
+
+    - name: Log test completion
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Completed Test 3: Nydus"
+      delegate_to: localhost
+      become: no
+
+- name: Test 4 - SOCI (AWS Lazy Loading)
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    benchmark_dir: "./comprehensive-benchmark-{{ hostvars['localhost']['benchmark_timestamp'] | default(ansible_date_time.epoch) }}"
+  tasks:
+    - name: Log test start
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Starting Test 4: SOCI"
+      delegate_to: localhost
+      become: no
+
+    - name: Check if SOCI is installed
+      shell: kubectl get nodes -o wide
+      register: nodes_check
+
+    - name: Run SOCI test (if installed)
+      include: test-soci.yml
+      ignore_errors: yes
+
+    - name: Copy SOCI results to benchmark directory
+      shell: |
+        if [ -d "soci-test-*" ]; then
+          LATEST_DIR=$(ls -td soci-test-* | head -1)
+          cp -r "$LATEST_DIR" "{{ benchmark_dir }}/soci-test" 2>/dev/null || true
+        fi
+      delegate_to: localhost
+      become: no
+
+    - name: Log test completion
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Completed Test 4: SOCI"
+      delegate_to: localhost
+      become: no
+
+- name: Test 5 - Stargz (Google Lazy Loading)
+  hosts: master
+  become: yes
+  become_user: ubuntu  
+  vars:
+    benchmark_dir: "./comprehensive-benchmark-{{ hostvars['localhost']['benchmark_timestamp'] | default(ansible_date_time.epoch) }}"
+  tasks:
+    - name: Log test start
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Starting Test 5: Stargz"
+      delegate_to: localhost
+      become: no
+
+    - name: Run Stargz test (if installed)
+      include: test-stargz.yml
+      ignore_errors: yes
+
+    - name: Copy Stargz results to benchmark directory
+      shell: |
+        if [ -d "stargz-test-*" ]; then
+          LATEST_DIR=$(ls -td stargz-test-* | head -1)
+          cp -r "$LATEST_DIR" "{{ benchmark_dir }}/stargz-test" 2>/dev/null || true
+        fi
+      delegate_to: localhost
+      become: no
+
+    - name: Log test completion
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: "[{{ ansible_date_time.time }}] Completed Test 5: Stargz"
+      delegate_to: localhost
+      become: no
+
+- name: Generate comprehensive benchmark report
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    benchmark_dir: "./comprehensive-benchmark-{{ hostvars['localhost']['benchmark_timestamp'] | default(ansible_date_time.epoch) }}"
+  tasks:
+    - name: Extract timing results from all tests
+      shell: |
+        echo "# COMPREHENSIVE BENCHMARK RESULTS"
+        echo "Generated: {{ ansible_date_time.iso8601 }}"
+        echo ""
+        
+        # Helper function to extract duration
+        extract_duration() {
+          local file="$1"
+          if [ -f "$file" ]; then
+            grep "Duration:" "$file" | head -1 | awk '{print $2}' || echo "N/A"
+          else
+            echo "N/A"
+          fi
+        }
+        
+        # Helper function to extract PyTorch import time
+        extract_pytorch() {
+          local file="$1"
+          if [ -f "$file" ]; then
+            grep "Import time:" "$file" | head -1 | awk '{print $3}' || echo "N/A"  
+          else
+            echo "N/A"
+          fi
+        }
+        
+        echo "## Test Results Summary"
+        echo ""
+        echo "| Technology | Container Ready (s) | PyTorch Import (s) | Status |"
+        echo "|------------|--------------------|--------------------|---------|"
+        
+        # VCR
+        VCR_READY=$(extract_duration "{{ benchmark_dir }}/vcr-test/test-results.log")
+        VCR_PYTORCH=$(extract_pytorch "{{ benchmark_dir }}/vcr-test/pytorch-test.log")
+        VCR_STATUS=$(grep -q "PASSED ✓" "{{ benchmark_dir }}/vcr-test/test-results.log" 2>/dev/null && echo "✓ PASS" || echo "✗ FAIL")
+        echo "| VCR (External) | $VCR_READY | $VCR_PYTORCH | $VCR_STATUS |"
+        
+        # Harbor OCI
+        HARBOR_READY=$(extract_duration "{{ benchmark_dir }}/harbor-oci-test/test-results.log")
+        HARBOR_PYTORCH=$(extract_pytorch "{{ benchmark_dir }}/harbor-oci-test/pytorch-test.log")
+        HARBOR_STATUS=$(grep -q "PASSED ✓" "{{ benchmark_dir }}/harbor-oci-test/test-results.log" 2>/dev/null && echo "✓ PASS" || echo "✗ FAIL")
+        echo "| Harbor OCI | $HARBOR_READY | $HARBOR_PYTORCH | $HARBOR_STATUS |"
+        
+        # Nydus
+        NYDUS_READY=$(extract_duration "{{ benchmark_dir }}/nydus-test/test-results.log")
+        NYDUS_PYTORCH=$(extract_pytorch "{{ benchmark_dir }}/nydus-test/pytorch-test.log")
+        NYDUS_STATUS=$(grep -q "PASSED ✓" "{{ benchmark_dir }}/nydus-test/test-results.log" 2>/dev/null && echo "✓ PASS" || echo "✗ FAIL")
+        echo "| Harbor + Nydus | $NYDUS_READY | $NYDUS_PYTORCH | $NYDUS_STATUS |"
+        
+        # SOCI  
+        SOCI_READY=$(extract_duration "{{ benchmark_dir }}/soci-test/test-results.log")
+        SOCI_PYTORCH=$(extract_pytorch "{{ benchmark_dir }}/soci-test/pytorch-test.log")
+        SOCI_STATUS=$(grep -q "PASSED ✓" "{{ benchmark_dir }}/soci-test/test-results.log" 2>/dev/null && echo "✓ PASS" || echo "✗ FAIL")
+        echo "| SOCI | $SOCI_READY | $SOCI_PYTORCH | $SOCI_STATUS |"
+        
+        # Stargz
+        STARGZ_READY=$(extract_duration "{{ benchmark_dir }}/stargz-test/test-results.log")
+        STARGZ_PYTORCH=$(extract_pytorch "{{ benchmark_dir }}/stargz-test/pytorch-test.log")
+        STARGZ_STATUS=$(grep -q "PASSED ✓" "{{ benchmark_dir }}/stargz-test/test-results.log" 2>/dev/null && echo "✓ PASS" || echo "✗ FAIL")
+        echo "| Stargz | $STARGZ_READY | $STARGZ_PYTORCH | $STARGZ_STATUS |"
+        
+        echo ""
+        echo "## Performance Analysis"
+        echo ""
+        
+        # Find the fastest technology
+        echo "### Container Startup Performance"
+        if [[ "$NYDUS_READY" != "N/A" && "$HARBOR_READY" != "N/A" ]]; then
+          SPEEDUP=$(awk "BEGIN {printf \"%.1f\", $HARBOR_READY / $NYDUS_READY}")
+          echo "- Nydus vs Harbor OCI: **${SPEEDUP}x faster**"
+        fi
+        
+        echo ""
+        echo "### Technology Comparison"
+        echo "- **VCR (External)**: Traditional OCI from external registry"
+        echo "- **Harbor OCI**: Traditional OCI from internal Harbor registry" 
+        echo "- **Nydus**: Lazy loading with chunk-based fetching"
+        echo "- **SOCI**: AWS lazy loading with sparse file ranges"
+        echo "- **Stargz**: Google lazy loading with gzipped chunks"
+        
+        echo ""
+        echo "## Raw Test Data"
+        echo ""
+        echo "Detailed logs available in subdirectories:"
+        echo "- vcr-test/ - VCR external registry results"
+        echo "- harbor-oci-test/ - Harbor internal OCI results"
+        echo "- nydus-test/ - Nydus lazy loading results"
+        echo "- soci-test/ - SOCI lazy loading results"
+        echo "- stargz-test/ - Stargz lazy loading results"
+        
+      register: benchmark_report
+
+    - name: Save comprehensive benchmark report
+      copy:
+        content: "{{ benchmark_report.stdout }}"
+        dest: "{{ benchmark_dir }}/BENCHMARK-REPORT.md"
+      delegate_to: localhost
+      become: no
+
+    - name: Complete benchmark log
+      lineinfile:
+        path: "{{ benchmark_dir }}/benchmark-overview.log"
+        line: |
+          [{{ ansible_date_time.time }}] Comprehensive benchmark completed
+          
+          ========================================
+          BENCHMARK COMPLETE
+          ========================================
+          
+          Results saved to: {{ benchmark_dir }}/
+          
+          Summary report: {{ benchmark_dir }}/BENCHMARK-REPORT.md
+          
+      delegate_to: localhost
+      become: no
+
+    - name: Display final benchmark results
+      debug:
+        msg:
+          - "========================================"
+          - "COMPREHENSIVE BENCHMARK COMPLETE"
+          - "========================================"
+          - ""
+          - "{{ benchmark_report.stdout_lines }}"
+          - ""
+          - "========================================"
+          - "All results saved to: {{ benchmark_dir }}/"
+          - "Summary report: {{ benchmark_dir }}/BENCHMARK-REPORT.md"

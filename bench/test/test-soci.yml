@@ -1,0 +1,217 @@
+---
+# Test SOCI Lazy Loading Performance
+# Usage: ansible-playbook -i hosts.ini test-soci.yml
+
+- name: Clean up before test
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  tasks:
+    - name: Delete any existing test pods
+      shell: kubectl delete pod test-soci --ignore-not-found=true
+
+- name: Clear cache on workers
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-soci"
+  tasks:
+    - name: Cordon worker to prevent pod scheduling during cleanup
+      shell: kubectl cordon {{ ansible_hostname }}
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+    - name: Remove test image refs from containerd
+      shell: |
+        ctr -n k8s.io images rm {{ test_image }} 2>/dev/null || true
+        ctr -n k8s.io images ls | grep jupyter | awk '{print $1}' | xargs -r ctr -n k8s.io images rm 2>/dev/null || true
+
+    - name: Remove all SOCI snapshots from containerd metadata
+      # Must do this BEFORE wiping SOCI data dirs - removes containerd's own
+      # knowledge of the snapshots so it won't hit "already exists" on re-unpack.
+      shell: |
+        ctr -n k8s.io snapshots --snapshotter soci ls 2>/dev/null | tail -n +2 | awk '{print $1}' | while read snap; do
+          if [ -n "$snap" ]; then
+            ctr -n k8s.io snapshots --snapshotter soci rm "$snap" 2>/dev/null || true
+          fi
+        done
+
+    - name: Remove content blobs with stale SOCI GC references
+      # containerd content store holds blobs with gc.ref.snapshot.soci labels.
+      # If these are not removed, containerd tries to re-unpack into SOCI and
+      # fails with "already exists" because the blob still points to a snapshot
+      # that no longer exists (or was just wiped).
+      shell: |
+        ctr -n k8s.io content ls 2>/dev/null | grep "containerd.io/gc.ref.snapshot.soci" | awk '{print $1}' | while read digest; do
+          if [ -n "$digest" ]; then
+            ctr -n k8s.io content rm "$digest" 2>/dev/null || true
+          fi
+        done
+
+    - name: Stop services before wiping SOCI data directories
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - containerd
+        - soci-snapshotter
+
+    - name: Wipe SOCI snapshot and index data directories
+      shell: |
+        rm -rf /var/lib/soci-snapshotter-grpc/snapshots/
+        rm -rf /var/lib/soci-snapshotter-grpc/indices/
+
+    - name: Start SOCI snapshotter
+      systemd:
+        name: soci-snapshotter
+        state: started
+
+    - name: Start containerd
+      systemd:
+        name: containerd
+        state: started
+
+    - name: Start kubelet
+      systemd:
+        name: kubelet
+        state: started
+
+    - name: Wait for SOCI socket to be ready
+      wait_for:
+        path: /run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock
+        timeout: 30
+
+    - name: Wait for node to be Ready before uncordon
+      shell: kubectl wait node {{ ansible_hostname }} --for=condition=Ready --timeout=120s
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+    - name: Uncordon worker
+      shell: kubectl uncordon {{ ansible_hostname }}
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+- name: Test SOCI lazy loading
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_image: "harbor.example.com/myproject/jupyter-pytorch-cuda-full:v1.9.2-soci"
+    log_dir: "./soci-test-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Create log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: no
+
+    - name: Export log_dir so the worker-cache play uses the same folder
+      set_fact:
+        soci_log_dir: "{{ log_dir }}"
+
+    - name: Start timing and deploy pod with SOCI
+      shell: |
+        START=$(date +%s.%N)
+        
+        kubectl run test-soci \
+          --image={{ test_image }} \
+          --restart=Never \
+          --image-pull-policy=Always \
+          --overrides='{
+            "spec": {
+              "imagePullSecrets": [{"name": "harbor-creds"}],
+              "containers": [{
+                "name": "test-soci",
+                "image": "{{ test_image }}",
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/api",
+                    "port": 8888
+                  },
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 5
+                }
+              }]
+            }
+          }'
+        
+        kubectl wait --for=condition=Ready pod/test-soci --timeout=600s
+        
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+        
+        echo "==================================="
+        echo "SOCI Lazy Loading Performance"
+        echo "==================================="
+        echo "Ready time: ${DURATION} seconds"
+        echo ""
+        kubectl describe pod test-soci | grep -A 20 "Events:"
+      register: soci_result
+      ignore_errors: yes
+
+    - name: Test PyTorch import performance
+      shell: |
+        START=$(date +%s.%N)
+        kubectl exec test-soci -- python3 -c "import torch; print('PyTorch version:', torch.__version__)"
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+        echo "PyTorch import time: ${DURATION} seconds"
+      register: pytorch_result
+      when: soci_result.rc == 0
+
+    - name: Save test results
+      copy:
+        content: |
+          ========================================
+          SOCI Test Results
+          ========================================
+          Date: {{ ansible_date_time.iso8601 }}
+          Image: {{ test_image }}
+          SOCI Version: 0.12.1
+          
+          {{ soci_result.stdout }}
+          
+          {{ pytorch_result.stdout | default('PyTorch test skipped') }}
+          
+          Status: {{ 'PASSED' if soci_result.rc == 0 else 'FAILED' }}
+        dest: "{{ log_dir }}/test-results.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display results
+      debug:
+        msg:
+          - "========================================"
+          - "SOCI Test Results"
+          - "========================================"
+          - "{{ soci_result.stdout_lines }}"
+          - ""
+          - "{{ pytorch_result.stdout_lines | default(['PyTorch test skipped']) }}"
+          - ""
+          - "Results saved to: {{ log_dir }}/test-results.log"
+
+- name: Check SOCI cache usage on workers
+  hosts: workers
+  become: yes
+  vars:
+    log_dir: "{{ hostvars[groups['master'][0]]['soci_log_dir'] }}"
+  tasks:
+    - name: Check SOCI cache size
+      shell: du -sh /var/lib/soci-snapshotter-grpc/ 2>/dev/null || echo "N/A (snapshot race)"
+      register: cache_size
+      
+    - name: Save worker stats
+      blockinfile:
+        path: "{{ log_dir }}/worker-cache.log"
+        marker: "# {mark} {{ inventory_hostname }}"
+        create: yes
+        block: |
+          Worker: {{ inventory_hostname }}
+          SOCI cache: {{ cache_size.stdout }}
+      delegate_to: localhost
+      become: no

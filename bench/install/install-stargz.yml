@@ -1,0 +1,213 @@
+---
+# Install Stargz Snapshotter
+# Google eStargz lazy loading format for container images
+# Ref: https://github.com/containerd/stargz-snapshotter/blob/main/docs/INSTALL.md
+#
+# Usage: ansible-playbook -i hosts.ini install-stargz.yml
+
+- name: Install Stargz snapshotter on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    stargz_version: "0.15.1"
+    stargz_url: "https://github.com/containerd/stargz-snapshotter/releases/download/v{{ stargz_version }}"
+
+  tasks:
+    - name: Ensure FUSE kernel module is loaded
+      # stargz uses FUSE to serve the lazy filesystem - required
+      modprobe:
+        name: fuse
+        state: present
+
+    - name: Persist FUSE module across reboots
+      lineinfile:
+        path: /etc/modules-load.d/fuse.conf
+        line: fuse
+        create: yes
+
+    - name: Create Stargz directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /etc/containerd-stargz-grpc
+        - /var/lib/containerd-stargz-grpc
+        - /run/containerd-stargz-grpc
+
+    - name: Download Stargz snapshotter tarball
+      get_url:
+        url: "{{ stargz_url }}/stargz-snapshotter-v{{ stargz_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/stargz-snapshotter.tar.gz"
+        mode: '0644'
+
+    - name: Extract and install Stargz binaries
+      # Handle both flat and subdirectory tarball layouts
+      shell: |
+        mkdir -p /tmp/stargz-tmp
+        tar -xzf /tmp/stargz-snapshotter.tar.gz -C /tmp/stargz-tmp
+        find /tmp/stargz-tmp -name containerd-stargz-grpc -exec cp {} /usr/local/bin/ \;
+        find /tmp/stargz-tmp -name ctr-remote -exec cp {} /usr/local/bin/ \;
+        chmod +x /usr/local/bin/containerd-stargz-grpc /usr/local/bin/ctr-remote
+        rm -rf /tmp/stargz-tmp /tmp/stargz-snapshotter.tar.gz
+
+    - name: Create Stargz snapshotter configuration with CRI-based authentication
+      # CRI keychain: snapshotter proxies CRI ImageService, kubelet sends creds via CRI.
+      # No hardcoded credentials needed - uses harbor-creds Kubernetes secret.
+      # Requires kubelet --image-service-endpoint configured below.
+      copy:
+        content: |
+          # Stargz Snapshotter v{{ stargz_version }} configuration
+          # Root must match proxy_plugins.stargz.exports.root in containerd config
+          root = "/var/lib/containerd-stargz-grpc"
+
+          [background_fetch]
+          disable = false
+          silence_period_msec = 10000
+          fetch_period_msec = 500
+          max_parallelism = 10
+
+          # CRI-based authentication: intercept kubelet image pulls to extract registry creds.
+          # Stargz serves CRI ImageService on its own socket; kubelet is redirected to it.
+          [cri_keychain]
+          enable_keychain = true
+          image_service_path = "/run/containerd/containerd.sock"
+        dest: /etc/containerd-stargz-grpc/config.toml
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Create Stargz snapshotter systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=Stargz Snapshotter v{{ stargz_version }}
+          After=network-online.target
+          Wants=network-online.target
+          Before=containerd.service
+
+          [Service]
+          Type=notify
+          ExecStart=/usr/local/bin/containerd-stargz-grpc \
+            --config /etc/containerd-stargz-grpc/config.toml \
+            --root /var/lib/containerd-stargz-grpc \
+            --address /run/containerd-stargz-grpc/containerd-stargz-grpc.sock \
+            --log-level info
+          Restart=always
+          RestartSec=5
+          KillMode=mixed
+          LimitNOFILE=1048576
+          TasksMax=infinity
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/stargz-snapshotter.service
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable and start Stargz snapshotter service
+      systemd:
+        name: stargz-snapshotter
+        daemon_reload: yes
+        enabled: yes
+        state: started
+
+    - name: Wait for Stargz snapshotter socket
+      wait_for:
+        path: /run/containerd-stargz-grpc/containerd-stargz-grpc.sock
+        timeout: 30
+
+    - name: Generate fresh containerd default config and set stargz as snapshotter
+      # Use same pattern as install-soci.yml: fresh default config + targeted seds
+      shell: |
+        cp /etc/containerd/config.toml /etc/containerd/config.toml.backup-stargz
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/snapshotter = "overlayfs"/snapshotter = "stargz"/' /etc/containerd/config.toml
+        sed -i 's/disable_snapshot_annotations = true/disable_snapshot_annotations = false/' /etc/containerd/config.toml
+
+    - name: Append stargz proxy plugin to containerd config
+      # Use echo to avoid YAML linter false-positives on TOML [section] brackets
+      shell: |
+        echo '' >> /etc/containerd/config.toml
+        echo '[proxy_plugins.stargz]' >> /etc/containerd/config.toml
+        echo '  type = "snapshot"' >> /etc/containerd/config.toml
+        echo '  address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"' >> /etc/containerd/config.toml
+        echo '  [proxy_plugins.stargz.exports]' >> /etc/containerd/config.toml
+        echo '    root = "/var/lib/containerd-stargz-grpc"' >> /etc/containerd/config.toml
+
+    - name: Re-add nvidia runtime with stargz snapshotter
+      shell: |
+        nvidia-ctk runtime configure --runtime=containerd --set-as-default
+        if [ -f /etc/containerd/conf.d/99-nvidia.toml ]; then
+          sed -i 's/snapshotter = "overlayfs"/snapshotter = "stargz"/' /etc/containerd/conf.d/99-nvidia.toml
+        fi
+      when: inventory_hostname in groups['gpu_workers']
+      ignore_errors: yes
+
+    - name: Restart containerd to apply Stargz configuration
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Wait for containerd to be ready
+      pause:
+        seconds: 5
+
+    - name: Verify Stargz snapshotter plugin is loaded
+      shell: ctr plugins ls | grep stargz
+      register: stargz_plugin_check
+      changed_when: false
+
+    - name: Configure kubelet to use stargz as CRI image service endpoint
+      # Required for CRI keychain: kubelet must send image pull requests to stargz
+      # socket so stargz can intercept credentials from the CRI request.
+      lineinfile:
+        path: /var/lib/kubelet/kubeadm-flags.env
+        regexp: '--image-service-endpoint='
+        line: 'KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock --image-service-endpoint=unix:///run/containerd-stargz-grpc/containerd-stargz-grpc.sock"'
+      register: kubelet_config
+
+    - name: Restart kubelet to apply image-service-endpoint
+      systemd:
+        name: kubelet
+        state: restarted
+      when: kubelet_config.changed
+
+    - name: Display Stargz installation status
+      debug:
+        msg:
+          - "Stargz Snapshotter v{{ stargz_version }} installed on {{ inventory_hostname }}"
+          - "Plugin: {{ stargz_plugin_check.stdout }}"
+          - "Socket: /run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+          - "Data dir: /var/lib/containerd-stargz-grpc"
+          - "Auth: CRI keychain (uses harbor-creds Kubernetes secret)"
+
+- name: Verify Stargz installation on master
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  tasks:
+    - name: Check worker nodes are Ready
+      shell: kubectl get nodes -o wide
+      register: node_status
+      changed_when: false
+
+    - name: Display installation summary
+      debug:
+        msg:
+          - "=========================================="
+          - "Stargz Installation Complete"
+          - "=========================================="
+          - "Socket: /run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+          - "Data dir: /var/lib/containerd-stargz-grpc"
+          - "Auth: /root/.docker/config.json"
+          - ""
+          - "Node status:"
+          - "{{ node_status.stdout_lines }}"
+          - ""
+          - "Next steps:"
+          - "1. Convert image: ansible-playbook -i hosts.ini create-stargz-index.yml"
+          - "2. Run test:      ansible-playbook -i hosts.ini test-stargz.yml"

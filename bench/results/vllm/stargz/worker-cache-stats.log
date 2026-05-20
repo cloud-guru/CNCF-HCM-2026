@@ -1,0 +1,15 @@
+# BEGIN lab4
+Worker: lab4
+Stargz cache: 25G	/var/lib/containerd-stargz-grpc/
+Active snapshots: 92
+# END lab4
+# BEGIN lab3
+Worker: lab3
+Stargz cache: 16G	/var/lib/containerd-stargz-grpc/
+Active snapshots: 9
+# END lab3
+# BEGIN lab2
+Worker: lab2
+Stargz cache: 13G	/var/lib/containerd-stargz-grpc/
+Active snapshots: 9
+# END lab2

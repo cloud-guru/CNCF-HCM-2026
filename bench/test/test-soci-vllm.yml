@@ -1,0 +1,264 @@
+---
+# Test SOCI Lazy Loading with vLLM image
+# Image: harbor.example.com/myproject/vllm-openai:v0.12.0-soci
+# Requires: GPU node (lab4), SOCI installed (install-soci.yml)
+#
+# Usage: ansible-playbook -i hosts.ini test-soci-vllm.yml
+
+- name: Cleanup before testing
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-soci-vllm"
+  tasks:
+    - name: Delete existing test pod
+      shell: kubectl delete pod {{ test_pod_name }} --ignore-not-found=true
+
+- name: Clear cache on workers
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "harbor.example.com/myproject/vllm-openai:v0.12.0-soci"
+  tasks:
+    - name: Cordon worker to prevent pod scheduling during cleanup
+      shell: kubectl cordon {{ ansible_hostname }}
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+    - name: Remove test image refs from containerd
+      shell: |
+        ctr -n k8s.io images rm {{ test_image }} 2>/dev/null || true
+        ctr -n k8s.io images ls | grep vllm | awk '{print $1}' | xargs -r ctr -n k8s.io images rm 2>/dev/null || true
+
+    - name: Remove all SOCI snapshots from containerd metadata
+      shell: |
+        ctr -n k8s.io snapshots --snapshotter soci ls 2>/dev/null | tail -n +2 | awk '{print $1}' | while read snap; do
+          if [ -n "$snap" ]; then
+            ctr -n k8s.io snapshots --snapshotter soci rm "$snap" 2>/dev/null || true
+          fi
+        done
+
+    - name: Remove content blobs with stale SOCI GC references
+      shell: |
+        ctr -n k8s.io content ls 2>/dev/null | grep "containerd.io/gc.ref.snapshot.soci" | awk '{print $1}' | while read digest; do
+          if [ -n "$digest" ]; then
+            ctr -n k8s.io content rm "$digest" 2>/dev/null || true
+          fi
+        done
+
+    - name: Stop services before wiping SOCI data directories
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - containerd
+        - soci-snapshotter
+
+    - name: Wipe SOCI snapshot and index data directories
+      shell: |
+        rm -rf /var/lib/soci-snapshotter-grpc/snapshots/
+        rm -rf /var/lib/soci-snapshotter-grpc/indices/
+
+    - name: Start SOCI snapshotter
+      systemd:
+        name: soci-snapshotter
+        state: started
+
+    - name: Start containerd
+      systemd:
+        name: containerd
+        state: started
+
+    - name: Start kubelet
+      systemd:
+        name: kubelet
+        state: started
+
+    - name: Wait for SOCI socket
+      wait_for:
+        path: /run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock
+        timeout: 30
+
+    - name: Wait for node to be Ready before uncordon
+      shell: kubectl wait node {{ ansible_hostname }} --for=condition=Ready --timeout=120s
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+    - name: Uncordon worker
+      shell: kubectl uncordon {{ ansible_hostname }}
+      delegate_to: "{{ groups['master'][0] }}"
+      become_user: ubuntu
+      become: yes
+
+- name: Test SOCI lazy loading with vLLM
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_image: "harbor.example.com/myproject/vllm-openai:v0.12.0-soci"
+    image_pull_secret: "harbor-creds"
+    test_pod_name: "test-soci-vllm"
+    log_dir: "./soci-vllm-test-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Create log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: no
+
+    - name: Export log_dir for later plays
+      set_fact:
+        soci_vllm_log_dir: "{{ log_dir }}"
+
+    - name: Measure pod startup time
+      shell: |
+        START=$(date +%s.%N)
+
+        kubectl run {{ test_pod_name }} \
+          --image={{ test_image }} \
+          --restart=Never \
+          --image-pull-policy=Always \
+          --overrides='{
+            "spec": {
+              "nodeName": "worker-4",
+              "imagePullSecrets": [{"name": "{{ image_pull_secret }}"}],
+              "volumes": [{"name": "models", "persistentVolumeClaim": {"claimName": "llama-models-pvc"}}],
+              "containers": [{
+                "name": "{{ test_pod_name }}",
+                "image": "{{ test_image }}",
+                "command": ["vllm", "serve", "/models/meta-llama/Meta-Llama-3-8B", "--host=0.0.0.0", "--port=8000", "--served-model-name", "meta-llama/Meta-Llama-3-8B", "--load-format", "runai_streamer", "--disable-log-requests"],
+                "volumeMounts": [{"name": "models", "mountPath": "/models"}],
+                "resources": {
+                  "limits": {"nvidia.com/gpu": "1"},
+                  "requests": {"nvidia.com/gpu": "1"}
+                },
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/health",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10,
+                  "timeoutSeconds": 5,
+                  "successThreshold": 1,
+                  "failureThreshold": 60
+                }
+              }]
+            }
+          }'
+
+        kubectl wait --for=condition=Ready pod/{{ test_pod_name }} --timeout=600s
+
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+
+        echo "==================================="
+        echo "SOCI vLLM Lazy Loading Performance"
+        echo "==================================="
+        echo "Ready time: ${DURATION} seconds"
+        echo ""
+        kubectl describe pod {{ test_pod_name }} | grep -A 20 "Events:"
+      register: soci_result
+      async: 700
+      poll: 15
+      ignore_errors: yes
+
+    - name: Get node where pod is running
+      shell: kubectl get pod {{ test_pod_name }} -o jsonpath='{.spec.nodeName}'
+      register: pod_node
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Save test results
+      copy:
+        content: |
+          ========================================
+          SOCI vLLM Test Results
+          ========================================
+          Date: {{ ansible_date_time.iso8601 }}
+          Image: {{ test_image }}
+          Pod: {{ test_pod_name }}
+          Node: {{ pod_node.stdout | default('N/A') }}
+
+          {{ soci_result.stdout }}
+
+          Status: {{ 'PASSED' if soci_result.rc == 0 else 'FAILED' }}
+        dest: "{{ log_dir }}/test-results.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display results
+      debug:
+        msg:
+          - "========================================"
+          - "SOCI vLLM Test Results"
+          - "========================================"
+          - "{{ soci_result.stdout_lines }}"
+          - "{{ 'PASSED' if soci_result.rc == 0 else 'FAILED' }}"
+          - "Results saved to: {{ log_dir }}/test-results.log"
+
+- name: Test vLLM inference endpoint
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-soci-vllm"
+  tasks:
+    - name: Send Hello prompt to vLLM chat endpoint
+      shell: |
+        START=$(date +%s.%N)
+        OUTPUT=$(kubectl exec {{ test_pod_name }} -- curl -s -X POST http://localhost:8000/v1/completions \
+          -H "Content-Type: application/json" \
+          -d '{"model": "meta-llama/Meta-Llama-3-8B", "prompt": "Hello", "max_tokens": 50}')
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+        echo "$OUTPUT"
+        echo "Inference time: ${DURATION} seconds"
+      register: inference_test
+      when: soci_result.rc == 0
+      ignore_errors: yes
+
+    - name: Save inference test to log
+      copy:
+        content: |
+          ========================================
+          vLLM Inference Endpoint Test (SOCI)
+          ========================================
+          {{ inference_test.stdout | default('skipped') }}
+
+          Status: {{ 'PASSED' if (inference_test.rc | default(1)) == 0 else 'FAILED' }}
+        dest: "{{ hostvars[groups['master'][0]]['soci_vllm_log_dir'] }}/inference-test.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display inference test result
+      debug:
+        msg:
+          - "vLLM /v1/models: {{ 'PASSED' if (inference_test.rc | default(1)) == 0 else 'FAILED or skipped' }}"
+          - "{{ inference_test.stdout_lines | default(['(skipped)']) }}"
+
+- name: Check SOCI cache usage on workers
+  hosts: workers
+  become: yes
+  vars:
+    log_dir: "{{ hostvars[groups['master'][0]]['soci_vllm_log_dir'] }}"
+  tasks:
+    - name: Check SOCI cache size
+      shell: du -sh /var/lib/soci-snapshotter-grpc/ 2>/dev/null || echo "N/A"
+      register: cache_size
+
+    - name: Save worker stats
+      blockinfile:
+        path: "{{ log_dir }}/worker-cache.log"
+        marker: "# {mark} {{ inventory_hostname }}"
+        create: yes
+        block: |
+          Worker: {{ inventory_hostname }}
+          SOCI cache: {{ cache_size.stdout }}
+      delegate_to: localhost
+      become: no

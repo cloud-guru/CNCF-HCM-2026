@@ -1,0 +1,233 @@
+---
+# Test Normal OCI Image Pull with vLLM image from VCR (baseline)
+# Image: external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0
+# Requires: GPU node (lab4), overlayfs restored (install-normal.yml)
+#
+# Usage: ansible-playbook -i hosts.ini test-vcr-vllm.yml
+
+- name: Cleanup before testing
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-vcr-vllm"
+  tasks:
+    - name: Delete existing test pod
+      shell: kubectl delete pod {{ test_pod_name }} --ignore-not-found=true
+      changed_when: false
+
+    - name: Wait for pod deletion
+      pause:
+        seconds: 5
+
+- name: Purge image cache on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0"
+  tasks:
+    - name: List images to find test image
+      shell: ctr -n k8s.io images ls | grep "{{ test_image }}" || true
+      register: image_check
+      changed_when: false
+
+    - name: Remove test image from containerd
+      shell: ctr -n k8s.io images rm "{{ test_image }}"
+      when: image_check.stdout != ""
+      ignore_errors: yes
+
+    - name: Remove all overlayfs snapshots
+      shell: |
+        ctr -n k8s.io snapshots --snapshotter overlayfs ls | tail -n +2 | awk '{print $1}' | while read snap; do
+          if [ -n "$snap" ]; then
+            ctr -n k8s.io snapshots --snapshotter overlayfs rm "$snap" 2>/dev/null || true
+          fi
+        done
+      ignore_errors: yes
+
+    - name: Restart containerd to clear metadata cache
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Wait for containerd to be ready
+      pause:
+        seconds: 5
+
+    - name: Display cleanup status
+      debug:
+        msg: "{{ inventory_hostname }}: cleanup done"
+
+- name: Test VCR normal OCI image pull with vLLM
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_image: "external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0"
+    test_pod_name: "test-vcr-vllm"
+    log_dir: "./vcr-vllm-test-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Create log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: no
+
+    - name: Export log_dir for later plays
+      set_fact:
+        vcr_vllm_log_dir: "{{ log_dir }}"
+
+    - name: Wait for Cilium to be ready after containerd restart
+      pause:
+        seconds: 60
+
+    - name: Measure pod startup time with VCR OCI pull
+      shell: |
+        START=$(date +%s.%N)
+        kubectl run {{ test_pod_name }} \
+          --image={{ test_image }} \
+          --overrides='{
+            "spec": {
+              "nodeName": "worker-4",
+              "volumes": [{"name": "models", "persistentVolumeClaim": {"claimName": "llama-models-pvc"}}],
+              "containers": [{
+                "name": "{{ test_pod_name }}",
+                "image": "{{ test_image }}",
+                "command": ["vllm", "serve", "/models/meta-llama/Meta-Llama-3-8B", "--host=0.0.0.0", "--port=8000", "--served-model-name", "meta-llama/Meta-Llama-3-8B", "--load-format", "runai_streamer", "--disable-log-requests"],
+                "volumeMounts": [{"name": "models", "mountPath": "/models"}],
+                "resources": {
+                  "limits": {"nvidia.com/gpu": "1"},
+                  "requests": {"nvidia.com/gpu": "1"}
+                },
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/health",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10,
+                  "timeoutSeconds": 5,
+                  "successThreshold": 1,
+                  "failureThreshold": 60
+                }
+              }]
+            }
+          }'
+
+        if kubectl wait --for=condition=Ready pod/{{ test_pod_name }} --timeout=600s; then
+          END=$(date +%s.%N)
+          DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+          echo "==================================="
+          echo "VCR vLLM OCI Pull Performance"
+          echo "==================================="
+          echo "Ready time: ${DURATION} seconds"
+          echo ""
+          echo "Events:"
+          kubectl describe pod {{ test_pod_name }} | grep -A 20 "Events:"
+          exit 0
+        else
+          echo "Pod failed to start within 600 seconds"
+          kubectl describe pod {{ test_pod_name }} | tail -30
+          exit 1
+        fi
+      register: startup_time
+      async: 700
+      poll: 15
+      ignore_errors: yes
+
+    - name: Get node where pod is running
+      shell: kubectl get pod {{ test_pod_name }} -o jsonpath='{.spec.nodeName}'
+      register: pod_node
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Save test results
+      copy:
+        content: |
+          ========================================
+          VCR Normal OCI vLLM Test Results
+          ========================================
+          Date: {{ ansible_date_time.iso8601 }}
+          Image: {{ test_image }}
+          Pod: {{ test_pod_name }}
+          Node: {{ pod_node.stdout | default('N/A') }}
+
+          {{ startup_time.stdout }}
+
+          Status: {{ 'PASSED' if startup_time.rc == 0 else 'FAILED' }}
+        dest: "{{ log_dir }}/test-results.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display timing results
+      debug:
+        msg:
+          - "========================================"
+          - "VCR OCI vLLM Pull Time"
+          - "========================================"
+          - "{{ startup_time.stdout_lines }}"
+          - "{{ 'PASSED' if startup_time.rc == 0 else 'FAILED' }}"
+          - "Logs: {{ log_dir }}/"
+
+- name: Test vLLM inference endpoint
+  hosts: master
+  become: yes
+  become_user: ubuntu
+  vars:
+    test_pod_name: "test-vcr-vllm"
+  tasks:
+    - name: Send Hello prompt to vLLM endpoint
+      shell: |
+        START=$(date +%s.%N)
+        OUTPUT=$(kubectl exec {{ test_pod_name }} -- curl -s -X POST http://localhost:8000/v1/completions \
+          -H "Content-Type: application/json" \
+          -d '{"model": "meta-llama/Meta-Llama-3-8B", "prompt": "Hello", "max_tokens": 50}')
+        END=$(date +%s.%N)
+        DURATION=$(awk "BEGIN {printf \"%.2f\", $END - $START}")
+        echo "$OUTPUT"
+        echo "Inference time: ${DURATION} seconds"
+      register: inference_test
+      ignore_errors: yes
+
+    - name: Save inference test to log
+      copy:
+        content: |
+          ========================================
+          vLLM Inference Endpoint Test (VCR)
+          ========================================
+          {{ inference_test.stdout }}
+
+          Status: {{ 'PASSED' if inference_test.rc == 0 else 'FAILED' }}
+        dest: "{{ hostvars[groups['master'][0]]['vcr_vllm_log_dir'] }}/inference-test.log"
+      delegate_to: localhost
+      become: no
+
+    - name: Display inference test result
+      debug:
+        msg:
+          - "vLLM inference: {{ 'PASSED' if inference_test.rc == 0 else 'FAILED' }}"
+          - "{{ inference_test.stdout_lines }}"
+
+- name: Verify worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    test_image: "external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0"
+    log_dir: "{{ hostvars[groups['master'][0]]['vcr_vllm_log_dir'] }}"
+  tasks:
+    - name: Check disk usage after pull
+      shell: du -sh /var/lib/containerd/io.containerd.content.v1.content/ 2>/dev/null || echo "N/A"
+      register: disk_usage
+      changed_when: false
+
+    - name: Save worker node status
+      blockinfile:
+        path: "{{ log_dir }}/worker-image-stats.log"
+        marker: "# {mark} {{ inventory_hostname }}"
+        create: yes
+        block: |
+          Worker: {{ inventory_hostname }}
+          Containerd content store: {{ disk_usage.stdout }}
+      delegate_to: localhost
+      become: no

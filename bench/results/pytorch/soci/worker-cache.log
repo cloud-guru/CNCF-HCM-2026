@@ -1,0 +1,4 @@
+# BEGIN lab2
+Worker: lab2
+SOCI cache: 88K	/var/lib/soci-snapshotter-grpc/
+# END lab2

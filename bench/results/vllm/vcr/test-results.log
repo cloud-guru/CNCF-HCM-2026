@@ -1,0 +1,26 @@
+========================================
+VCR Normal OCI vLLM Test Results
+========================================
+Date: 2026-03-04T07:00:28Z
+Image: external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0
+Pod: test-vcr-vllm
+Node: worker-4
+
+pod/test-vcr-vllm created
+pod/test-vcr-vllm condition met
+===================================
+VCR vLLM OCI Pull Performance
+===================================
+Ready time: 350.46 seconds
+
+Events:
+Events:
+  Type     Reason     Age                  From     Message
+  ----     ------     ----                 ----     -------
+  Normal   Pulling    5m49s                kubelet  Pulling image "external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0"
+  Normal   Pulled     2m19s                kubelet  Successfully pulled image "external-registry.example.com/108942-public69/vllm-stack/vllm-openai:v0.12.0" in 3m30.024s (3m30.024s including waiting). Image size: 8931754811 bytes.
+  Normal   Created    2m19s                kubelet  Created container: test-vcr-vllm
+  Normal   Started    2m18s                kubelet  Started container test-vcr-vllm
+  Warning  Unhealthy  10s (x11 over 100s)  kubelet  Readiness probe failed: Get "http://10.244.3.25:8000/health": dial tcp 10.244.3.25:8000: connect: connection refused
+
+Status: PASSED

@@ -1,0 +1,15 @@
+# BEGIN lab4
+Worker: lab4
+Cache size: 19G	/var/lib/containerd-nydus/cache
+Cached chunks: 57
+# END lab4
+# BEGIN lab3
+Worker: lab3
+Cache size: 4.0K	/var/lib/containerd-nydus/cache
+Cached chunks: 0
+# END lab3
+# BEGIN lab2
+Worker: lab2
+Cache size: 4.0K	/var/lib/containerd-nydus/cache
+Cached chunks: 0
+# END lab2
